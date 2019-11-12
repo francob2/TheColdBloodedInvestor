@@ -1,0 +1,1376 @@
+---
+output:
+  pdf_document: default
+  html_document: default
+---
+# Shiny App Code
+
+We begin the Shiny application in this section. The first thing we have to do is load the various files that will be used to analyze a hypothetical portfolio. These files were created in the previous section. We need an example holdings file as well. We will randomly draw 20 pairs of securities from the cross sectional long-short output from the previous section and equally weight those securities. Thus, we'll have a total of 40 securities. We'll take weightings of 4% for longs and -4% for shorts, for a gross weighting of 160%. We will intentionally include some non-model securities as well. Why? Model drift and realistic holding periods that reflect the *half-life* of the model as a whole, necessitate that we don't trade *every* time a security moves out or into the model. 
+
+Let us examine the data structure for each of the objects that serve as raw inputs for our Shiny application that follows.
+
+```{r LoadData, eval=TRUE, echo=TRUE, message=FALSE, warning=FALSE, cache = FALSE, tidy = FALSE}
+
+library(shiny)
+library(tidyquant) 
+library(RODBC) #required to connect to SQL
+library(DBI) #SQL embedding into R
+library(magrittr) 
+library(tibbletime) 
+library(gridExtra) 
+library(scales)
+library(DT)
+library(QRM)
+library(plotly)
+
+#Load output from previous section
+#and compute feeder variables
+
+RoRs <- read_csv("RoRs.csv") 
+
+this_table <- read_csv("holdings.csv")
+rawTable <- as.data.frame(this_table)
+ModelWgtObject <- read_csv("ModelWgtObject.csv")
+RoRs_Aggregates <- read_csv("RoRs_Aggregates.csv")
+ALL_mostRecentXsection <- read_csv(
+  "ALL_mostRecentXsection.csv")
+IndustryMap <- read_csv("IndustryMap.csv")
+
+#Store raw data items in a list
+objectList <- list(RoRs,this_table,ModelWgtObject,
+  RoRs_Aggregates,ALL_mostRecentXsection,IndustryMap)
+
+#print the list
+print(objectList, 10)
+
+
+```
+
+```{r PrepData, eval=FALSE, echo=TRUE, message=FALSE, warning=FALSE, cache = FALSE, tidy = FALSE}
+
+RoRs_wide <- RoRs %>% 
+  spread(Ticker, ror) %>%
+  select(-date)
+
+joinedModelRisk <- inner_join(RoRs,ModelWgtObject,
+  by = "Ticker")
+
+RoRs_Aggregates_wide <- RoRs_Aggregates %>% 
+  spread(Ticker, ror) %>%
+  mutate(EconPos = GCC - GLD, SMB = IWM - SPY, 
+  VALUE = RPV - RPG, MTUM = SPMO - SPY) %>%
+  select(-date) %>%
+  select(SP500 = SPY, LTreas = TLT, Dollar = UUP,
+  Cmdty = GCC, 
+  EconPos, SMB, VALUE, MTUM)
+
+#Model
+covM_model <- joinedModelRisk %>%
+  select(-ModelWgt) %>%
+  spread(Ticker, ror) %>%
+  select(-date) %>%
+  cov(use = "pairwise.complete.obs")
+
+
+wgt_model <- joinedModelRisk %>%
+  select(Ticker, ModelWgt) %>%
+  group_by(Ticker) %>%
+  slice(1) %>%
+  ungroup() %>%
+  select(ModelWgt)
+
+Vol_model <- sqrt(t(wgt_model$ModelWgt/100) %*%
+  covM_model %*% 
+  wgt_model$ModelWgt/100) * sqrt(252)
+
+ModelRet <- joinedModelRisk %>% 
+  mutate(rorContrib = ror * ModelWgt/100) %>%
+  group_by(date) %>%
+  summarise(ModelRet_daily = sum(rorContrib))
+
+#Individual security vols, s&p betas, 
+#and industry betas for portfolio and model
+
+#Other individual security metrics that need to
+#be joined to ALL_mostrecentXsection
+
+CovSec_2_SP500 <- apply(RoRs_wide, 2, function (x) {
+  cov(RoRs_Aggregates_wide$SP500, x, 
+  use = "pairwise.complete.obs")})
+
+Var_sp500 <- var(RoRs_Aggregates_wide$SP500)
+BetaSec2SP500 <- CovSec_2_SP500 / Var_sp500 
+BetaSec2SP500 <- enframe(BetaSec2SP500) %>% 
+  rename(Ticker = name, SP500Beta = value)
+
+cumret_all_days <-  RoRs %>% 
+  group_by (Ticker) %>%
+  mutate(cumProd = cumprod(1+ror) )
+
+#Calculate 252, 65, 21, and 5 day returns for 
+#price momentum tibble to be joined to
+#ALL_mostrecentXsection
+
+PM<- cumret_all_days %>% 
+  ungroup() %>% 
+  select(-ror) %>% 
+  spread(Ticker, cumProd)
+
+PM252 <- PM[nrow(PM),2:ncol(PM)] / PM[nrow(PM)-252,
+  2:ncol(PM)] - 1
+PM252 <- PM252 %>% 
+  gather(Ticker, PM252)
+
+PM65 <- PM[nrow(PM),2:ncol(PM)]/ PM[nrow(PM)-65,
+  2:ncol(PM)] - 1
+PM65 <- PM65 %>% 
+  gather(Ticker, PM65)
+
+PM21 <- PM[nrow(PM),2:ncol(PM)] / PM[nrow(PM)-21,
+  2:ncol(PM)] - 1
+PM21 <- PM21 %>% 
+  gather(Ticker, PM21)
+
+PM5 <- PM[nrow(PM),2:ncol(PM)]/ PM[nrow(PM)-5,
+  2:ncol(PM)] - 1
+PM5 <- PM5 %>% gather(Ticker, PM5)
+
+PM <- cbind(PM252, PM65$PM65, PM21$PM21, PM5$PM5)
+PM <- PM %>% as_tibble() %>% rename(PM65 = `PM65$PM65`, 
+  PM21 = `PM21$PM21`, PM5 = `PM5$PM5`)
+
+```
+
+
+So note that Shiny applications are not supported in static R Markdown documents, the platform used to produce this book. What we can do instead is take pictures of the output and rendering of the code below. The reader should note that there are two important packages called 'webshot' and 'shinytest' that *do* have the capability of taking snapshots of a Shiny application, but that is *not* how the images below were captured. We have manual screenshots of the application as we interact with it. 
+
+Let us now take a look at the initial user interface in figure \@ref(fig:UI). The table on the right is a reactive datatable that initially populates with a holdings file. However, the user can edit the table with their own securities and weights, then click the desired processing buttons on the left side of the interface, and finally, create new portfolio metric outputs. Notice the processing buttons that correspond to the tabs at the top of the interface (note: with the exception of 'Universe Data'). Universe Data is rendered automatically, and just reflects the most recent cross sectional data. It is a data dump. Lastly, notice the simulation parameters that are used to calculate both the 1-day value-at-risk (VAR) and the multiperiod distributions of maximum drawdown.   
+
+```{r UI, echo = FALSE, fig.cap = 'Initial User Interface'}
+
+knitr::include_graphics("images/UI.png")
+
+```
+
+Let us look at more of the application before studying the code that generates it. In figure \@ref(fig:Sim1) we show the output of the simulations. The user can select the simulation type from the dropdown menu on the left. There is a choice of two fat-tailed distributions: Laplace and Student-T. There is also a choice to select the Normal distribution for comparison purposes. The first histogram shows the distribution of 1-day returns generated from one of the three chosen distributions. Keep in mind that the distributions are multivariate and take as input the correlation structure of the assets.
+
+```{r Sim1, echo = FALSE, fig.cap = 'Histogram of Returns From 1-Day Laplace Distribution With VAR'}
+
+knitr::include_graphics("images/ShinySims1.png")
+
+```
+
+Figure \@ref(fig:Sim2) zooms in on just the histogram of maximum drawdowns computed over the number of chosen simulations and timespan. 
+
+```{r Sim2, echo = FALSE, fig.cap = 'Histogram of Maximum Drawdowns From Multiperiod Laplace Distribution'}
+
+knitr::include_graphics("images/ShinySims2.png")
+
+```
+
+Figure \@ref(fig:RiskMetrics) shows a table of risk metrics so that the user can track how closely she is following a black-box implementation of the model. Notice that she's deviated substantially from the model, as seen in the rows labelled 'Gross Long OnModel' and 'Gross Short OnModel'. Also note that the portfolio average factor rank is about 40% less than the model's average factor rank. Note the comparisons of other metrics including: volatility, beta to the S&P 500, the standard deviation of risk contribution weights (labelled 'Risk_Wgt_Disp'), the diversification ratio (labelled 'DivR'), price momentum, market capitalization, and dollar value traded. 
+
+```{r RiskMetrics, echo = FALSE, fig.cap = 'A Comparison of Portfolio and Model Risk Metrics'}
+
+knitr::include_graphics("images/RiskMetrics.png")
+
+```
+
+A note about the diversification ratio (DivR) is in order. First, the metric was developed by Yves Choueifaty and was detailed in his paper "Toward Maximum Diversification" in 2008 [@wcref31]. In that paper he doesn't explicitly state whether the ratio can be modified for long-short portfolios. Why? It is defined so that higher values mean more diversification. But imagine a portfolio where the sum of the weights equals zero, we get a diversification ratio of zero. The ratio is supposed to be *lower* bounded at 1. Here is the diversification ratio:  
+
+$DivR = \frac{\mathop{\sum_{i}w_i\sigma_i}}{\sqrt{\mathop{\sum_{i}w_i^2\sigma_i^2+} \mathop{\sum_{i}\sum_{j}w_iw_j\sigma_i\sigma_j\rho_{ij}}_{i\ne{j}}}}$
+
+One possibility is to take absolute values of the weights, and the other possibility is to take the opposite sign of the returns, but only for short positions. These two approaches do not necessarily result in the same ratio, but at least we lower bound the ratio at one. If short positions are allowed, then leverage should be allowed. We need to prove that the diversification ratio is unaffected by leverage.
+
+```{theorem, divr, name = "Diversification ratio under leverage"}
+
+The diversification ratio:
+
+$$DivR = \frac{\mathop{\sum_{i}w_i\sigma_i}}{\sqrt{\mathop{\sum_{i}w_i^2\sigma_i^2+} \mathop{\sum_{i}\sum_{j}w_iw_j\sigma_i\sigma_j\rho_{ij}}_{i\ne{j}}}}$$
+
+is unaffected by constant scalings of the portfolio weights $w_i$.
+
+Proof:
+
+Let $w_i = Nw_i$ and let $w_j = Nw_j$ 
+
+Observe that the constant $N$ can be pulled out of the summation
+expressions and factored out of the denominator so that:
+
+$$\frac{N(\ldots)}{\sqrt{N^2(\ldots+\ldots)}}$$
+
+The $N$ term vanishes, and the proof is complete.
+  
+```
+
+Let us look at the code for the user interface.
+
+```{r UserInterface, eval=FALSE, echo=TRUE, message=FALSE, warning=FALSE, cache = FALSE, tidy = FALSE}
+
+ui <- fluidPage(uiOutput("moreControls"),
+  tabsetPanel(tabPanel("Build", fluid = TRUE,
+  sidebarLayout(
+  sidebarPanel(
+  sliderInput("wgt",
+  "Weight:",
+  min = -10,
+  max = 10,
+  value = 5,
+  step = 0.25),                                     
+  fluidRow(column(6,textInput("ticker",
+  "Add Ticker:"))),
+  actionButton("add_btn", "Add"),
+  actionButton("delete_btn", "Delete"),
+  fluidRow(helpText ("")),
+  fluidRow(helpText ("")),
+  helpText("Click Below to Process:"),
+  fluidRow(column(4,actionButton("char",
+  "Characteristics")),
+  column(4,actionButton("sims", "Simulations")),
+  column(4, actionButton("exp", "Exposures"))),
+  fluidRow(helpText ("")),
+  fluidRow(helpText("")),
+  fluidRow(column(4, actionButton("expSens", 
+  "Exposures with Market Sensitivities"))),
+  fluidRow(helpText("")),
+  fluidRow(helpText("")),
+  helpText("Enter Simulation Parameters Below:"),
+  fluidRow(column(4,
+  numericInput("nSim", "# 1-Day Rets", 
+  value = 100, min = 0, max = 1000000, step = 1000)),
+  column(6, numericInput("nDays", 
+  "# MultiPrd SimDays", value = 252,
+  min = 0, max = 252*5, step =252))),
+  fluidRow(helpText("")),
+  fluidRow(column(6,numericInput("nSim_ts", 
+  "# n-Day Simulations to Run", value = 100, 
+  min = 0, max = 1000000, step = 10000))),
+  fluidRow(helpText(""))),
+  mainPanel(column(4,DTOutput("shiny_table"))))), 
+  tabPanel("Characteristics", fluid = TRUE, 
+  mainPanel(DTOutput("shiny_table_sum"))),
+  tabPanel("Simulations", fluid = TRUE, sidebarLayout(
+  sidebarPanel ( width = 2,
+  selectInput("simType", "Simulation Type:", 
+  c("", "Laplace" = "Laplace", "Normal" = "Normal", 
+  "Student_T" = "Student_T"), selected = NULL)), 
+  mainPanel( width = 10,
+  fluidRow( column(6,plotOutput("sim_data")),
+  column(6,plotOutput("sim_nday_data"))),
+  fluidRow( column(6,
+  verbatimTextOutput("sim_summary")),  
+  column(6,verbatimTextOutput("sim_nday_summary")))))),
+  tabPanel("Universe Data", fluid = TRUE, 
+  mainPanel(DTOutput("UnivData"))),
+  tabPanel("Exposures with Market Sensitivities", 
+  fluidRow(column(5, DTOutput("Exposures")), 
+  column(5, DTOutput("Sensitivities"))))))
+
+```
+
+Finally, here is the server code that holds all the mathematical details.
+
+```{r TheWebServer, eval=FALSE, echo=TRUE, message=FALSE, warning=FALSE, cache = FALSE, tidy = FALSE}
+
+server <- function(input, output) {
+  
+x = reactiveValues(df = rawTable) 
+output$shiny_table <- renderDT(isolate(x$df), 
+  selection = 'single', editable = T)
+
+proxy = dataTableProxy('shiny_table')
+  
+observe({
+    
+observeEvent(input$expSens, {
+  joinedPortRisk <- inner_join(RoRs, x$df, 
+  by = c("Ticker" = "ticker"))
+  
+joinedModelRisk <- inner_join(RoRs,ModelWgtObject, 
+  by = "Ticker")
+      
+  RoRs_Aggregates_wide <- RoRs_Aggregates %>% 
+  spread(Ticker, ror) %>%
+mutate(EconPos = GCC - GLD, SMB = IWM - SPY,
+  VALUE = RPV - RPG, MTUM = SPMO - SPY) %>%
+  select(-date) %>%
+  select(SP500 = SPY, LTreas = TLT, Dollar = UUP, 
+  Cmdty = GCC, EconPos, SMB, VALUE, MTUM,
+  ACAlt = ACVKX, AmCent = ALIAX,
+  ConVerge = CPMNX, Invesco = CPNSX, JPMorgan = JPMNX, 
+  Nuveen = NIMEX, Putnam = PPMAX, AQR = QMNIX,
+  Vanguard = VMNIX, Zacks = ZMNIX)
+      
+#portfolio
+covM <- joinedPortRisk %>%
+  select(-wgt) %>%
+  spread(Ticker, ror) %>%
+  select(-date) %>%
+  cov(use = "pairwise.complete.obs")
+      
+wgt <- joinedPortRisk %>%
+  select(Ticker, wgt) %>%
+  group_by(Ticker) %>%
+  slice(1) %>%
+  ungroup() %>%
+  select(wgt)
+      
+PortVol <- sqrt(t(wgt$wgt/100) %*% covM %*% 
+  wgt$wgt/100) * sqrt(252)
+      
+PortRet <- joinedPortRisk %>% 
+  mutate(rorContrib = ror * wgt/100) %>%
+  group_by(date) %>%
+  summarise(PortRet_daily = sum(rorContrib))
+
+#model
+covM_model <- joinedModelRisk %>%
+  select(-ModelWgt) %>%
+  spread(Ticker, ror) %>%
+  select(-date) %>%
+  cov(use = "pairwise.complete.obs")
+      
+wgt_model <- joinedModelRisk %>%
+  select(Ticker, ModelWgt) %>%
+  group_by(Ticker) %>%
+  slice(1) %>%
+  ungroup() %>%
+  select(ModelWgt)
+      
+Vol_model <- sqrt(t(wgt_model$ModelWgt/100) %*% 
+  covM_model %*% wgt_model$ModelWgt/100) * sqrt(252)
+      
+ModelRet <- joinedModelRisk %>% 
+  mutate(rorContrib = ror * ModelWgt/100) %>%
+  group_by(date) %>%
+  summarise(ModelRet_daily = sum(rorContrib))
+
+#individual security vols,  s&p betas, 
+#industry betas for portfolio and model
+      
+#Correlate Portfolio to each Market Aggregate
+PortCor2Aggr <- apply(RoRs_Aggregates_wide, 2, 
+  function (x) {
+  cor(PortRet$PortRet_daily, x, 
+  use = "pairwise.complete.obs")})
+      
+#Beta of Portfolio to each Market Aggregate
+PortCov2Aggr <- apply(RoRs_Aggregates_wide, 2,
+  function (x) {cov(PortRet$PortRet_daily, x,
+  use = "pairwise.complete.obs")}) 
+
+VAR_Aggr <- apply(RoRs_Aggregates_wide, 2,
+  function (x) {var(x, na.rm = TRUE)}) 
+  PortBeta2Aggr <- PortCov2Aggr / VAR_Aggr
+      
+#Correlate Model to each Market Aggregate
+  ModelCor2Aggr <- apply(RoRs_Aggregates_wide, 2,
+  function (x) {cor(ModelRet$ModelRet_daily, x, 
+  use = "pairwise.complete.obs")})
+      
+#Beta of Model to each Market Aggregate
+PortCov2Aggr <- apply(RoRs_Aggregates_wide, 2, 
+  function (x) {cov(ModelRet$ModelRet_daily, x,
+  use = "pairwise.complete.obs")})
+
+ModelBeta2Aggr <- PortCov2Aggr / VAR_Aggr
+      
+#Clean up
+PortCor2Aggr <- enframe(PortCor2Aggr) %>% 
+  rename(Index = name, Cor_port = value)
+PortBeta2Aggr <- enframe(PortBeta2Aggr) %>%
+  rename (Index = name, Beta_port = value)
+ModelCor2Aggr <- enframe(ModelCor2Aggr) %>% 
+  rename(Index = name, Cor_model = value)
+ModelBeta2Aggr <- enframe(ModelBeta2Aggr) %>% 
+  rename (Index = name, Beta_model = value)
+      
+CorCovAggr <- left_join(PortCor2Aggr, 
+  ModelCor2Aggr, by = "Index") %>% 
+  left_join(.,PortBeta2Aggr, by = "Index") %>% 
+  left_join(.,ModelBeta2Aggr, by = "Index")
+      
+CorCovAggr <- CorCovAggr %>% 
+  mutate(CorDiff = Cor_port - Cor_model, 
+  BetaDiff = Beta_port - Beta_model) %>%
+  mutate_at(2:7, list(~round(.,3))) 
+
+#This object will be the Shiny output for correlations
+#and beta of portfolio and model to various market
+#aggregates and funds, and it also shows the 
+#difference between portfolio and model values
+      
+#Other individual security metrics that need to be
+#joined to ALL_mostrecentXsection
+
+CovSec_2_SP500 <- apply(RoRs_wide, 2, function (x) {
+  cov(RoRs_Aggregates_wide$SP500, x,
+  use = "pairwise.complete.obs")})
+      
+Var_sp500 <- var(RoRs_Aggregates_wide$SP500)
+BetaSec2SP500 <- CovSec_2_SP500 / Var_sp500 
+#need to join to ALL_mostrecentXscetion
+BetaSec2SP500 <- enframe(BetaSec2SP500) %>% 
+  rename(Ticker = name, SP500Beta = value)
+      
+cumret_all_days <-  RoRs %>% 
+  group_by (Ticker) %>%
+  mutate(cumProd = cumprod(1+ror) )
+      
+#calculate 252, 65, 21, and 5 day returns for 
+#Price Momentum tibble to be joined to
+#ALL_mostrecentXsection
+
+PM<- cumret_all_days %>% 
+  ungroup() %>% 
+  select(-ror) %>% 
+  spread(Ticker, cumProd)
+      
+PM252 <- PM[nrow(PM),2:ncol(PM)]/ PM[nrow(PM)-252,
+  2:ncol(PM)] - 1
+PM252 <- PM252 %>% 
+  gather(Ticker, PM252)
+
+PM65 <- PM[nrow(PM),2:ncol(PM)]/ PM[nrow(PM)-65,
+  2:ncol(PM)] - 1
+PM65 <- PM65 %>% 
+  gather(Ticker, PM65)
+
+PM21 <- PM[nrow(PM),2:ncol(PM)]/ PM[nrow(PM)-21,
+  2:ncol(PM)] - 1
+PM21 <- PM21 %>% 
+  gather(Ticker, PM21)
+
+PM5 <- PM[nrow(PM),2:ncol(PM)]/ PM[nrow(PM)-5,
+  2:ncol(PM)] - 1
+PM5 <- PM5 %>% 
+  gather(Ticker, PM5)
+PM <- cbind(PM252, PM65$PM65, PM21$PM21, PM5$PM5)
+PM <- PM %>% as_tibble() %>% 
+  rename(PM65 = `PM65$PM65`, PM21 = `PM21$PM21`,
+  PM5 = `PM5$PM5`) 
+#This is the price momentum tibble to be joined to 
+#ALL_mostrecentXsection
+      
+PortWgtWithTicker <- joinedPortRisk %>%
+  select(Ticker, wgt) %>%
+  group_by(Ticker) %>%
+  slice(1) %>%
+  ungroup()
+      
+#To get group gross/nets/stats/weights 
+#combine sp500beta, price momentum, and weights
+#to all_mostrecentxsection.
+      
+Augmented_xsection <- left_join(ALL_mostRecentXsection, 
+  BetaSec2SP500, by = 'Ticker') %>%
+  left_join(., PM, by = 'Ticker') %>%
+  left_join(., ModelWgtObject, by = 'Ticker') %>%
+  left_join(.,PortWgtWithTicker, by = 'Ticker') %>%
+  mutate(ModelWgt = ModelWgt /100, wgt = wgt /100) %>%
+  rename(PortWgt = wgt) %>%
+  mutate_if(is.numeric,~ if_else(is.na(.x),0,.x)) 
+#convert all na's to zeros for numeric columns
+
+#Gross longs and shorts for port and model
+#Gross long weighting regardless of 
+#model/nonmmodel position
+      
+PortGross <- Augmented_xsection %>% 
+  group_by(sign(PortWgt)) %>% 
+  summarise(GrossWgt = sum(abs(PortWgt))) %>% 
+  rename(LS = 'sign(PortWgt)') %>%
+  arrange(desc(LS))
+      
+PortGrossOnModel <- Augmented_xsection %>% 
+  group_by(L_S) %>% 
+  summarise (GrossWgtOnModel = sum((abs(PortWgt))))
+      
+GrossBind <- cbind(PortGross, PortGrossOnModel)
+      
+GrossBind <- GrossBind %>% 
+  select(L_S, GrossWgt, GrossWgtOnModel) %>%
+  slice(1,3)
+      
+      
+ModelGross <- Augmented_xsection %>% 
+  group_by(sign(ModelWgt)) %>% 
+  summarise(GrossWgt = sum(abs(ModelWgt))) 
+#should always be 100% long/ 100% short
+  ModelGrossLong <- ModelGross[3,2]
+  ModelGrossShort <- ModelGross[1,2]
+  ModelOnModelGrossLong <- 1
+  ModelOnModelGrossShort <- 1
+      
+      
+#For obtaining the portfolio and model risk-weight
+#dispersion metric
+  
+portMCTR <- (wgt$wgt/100) %*% 
+  covM / (PortVol[1,1] /sqrt (252))
+portRiskContrib <- (portMCTR * (wgt$wgt/100)) / 
+  (PortVol[1,1] / sqrt(252))
+portRiskContrib <- (portRiskContrib)
+portRWDM <- round(sd(portRiskContrib),4)
+      
+#Model
+modelMCTR <- (wgt_model$ModelWgt/100) %*% 
+  covM_model / (Vol_model[1,1] /sqrt (252))
+  modelRiskContrib <- (modelMCTR * 
+  (wgt_model$ModelWgt/100)) /
+  (Vol_model[1,1] / sqrt(252))
+  modelRiskContrib <- (modelRiskContrib)
+      
+modelRWDM <- round(sd(modelRiskContrib),4)
+      
+#Diversification ratio with long-short
+#modification portfolio
+
+portDiv <- round((abs(Augmented_xsection$PortWgt) %*%
+  Augmented_xsection$Vol) / PortVol[1,1],2)
+      
+#Model
+modelDiv <- round((abs(Augmented_xsection$ModelWgt) %*%
+  Augmented_xsection$Vol) / Vol_model[1,1],2)
+      
+#Price momentum of portfolio [net]
+portPM252 <- round((Augmented_xsection$PM252 %*%
+  Augmented_xsection$PortWgt),4)
+portPM65 <- round((Augmented_xsection$PM65 %*%
+  Augmented_xsection$PortWgt),4)
+portPM21 <- round((Augmented_xsection$PM21 %*%
+  Augmented_xsection$PortWgt),4)
+portPM5 <- round((Augmented_xsection$PM5 %*%
+  Augmented_xsection$PortWgt),4)
+      
+#Model [net]
+modelPM252 <- round((Augmented_xsection$PM252 %*%
+  Augmented_xsection$ModelWgt),4)
+modelPM65 <- round((Augmented_xsection$PM65 %*%
+  Augmented_xsection$ModelWgt),4)
+modelPM21 <- round((Augmented_xsection$PM21 %*%
+  Augmented_xsection$ModelWgt),4)
+modelPM5 <- round((Augmented_xsection$PM5 %*%
+  Augmented_xsection$ModelWgt),4)
+      
+#Value-added factors [net]
+portFactor <- round(Augmented_xsection$MedRank %*%
+  Augmented_xsection$PortWgt,2)
+  modelFactor <- round(Augmented_xsection$MedRank %*% 
+  Augmented_xsection$ModelWgt,2)
+      
+#Mktcap [net] $million
+portMktCap <- round((Augmented_xsection$MktCap %*%
+  Augmented_xsection$PortWgt)/1000000,0)
+  modelMktCap <- round((Augmented_xsection$MktCap %*%
+  Augmented_xsection$ModelWgt) / 1000000,0)
+      
+#ValTraded [net] $million
+portValTraded <- round(
+  (Augmented_xsection$MedValTrade %*%
+  Augmented_xsection$PortWgt) / 1000000,0)
+  modelValTraded <- round(
+  (Augmented_xsection$MedValTrade %*%
+  Augmented_xsection$ModelWgt) / 1000000,0)
+      
+#Vol format
+PortVol <- (round(PortVol, 4))
+ModelVol <- (round(Vol_model, 4))
+      
+      
+#ExpChar tibbles
+portExpChar <-rename(
+  gather(as_tibble(cbind.data.frame(PortVol,
+  CorCovAggr[1,4], GrossBind[1,2], GrossBind[1,3],
+  GrossBind[2,2], GrossBind[2,3], portRWDM, portDiv, 
+  portFactor, portPM252, portPM65, portPM21, portPM5,
+  portMktCap, portValTraded))), Portmetric = key,
+  portfolio = value)
+      
+modelExpChar <- rename(gather(as_tibble(
+  cbind.data.frame(ModelVol,
+  CorCovAggr[1,5], as.numeric(ModelGrossLong[1,1]),
+  ModelOnModelGrossLong,
+  as.numeric(ModelGrossShort[1,1]),
+  ModelOnModelGrossShort, modelRWDM, modelDiv,
+  modelFactor, modelPM252, modelPM65, modelPM21,
+  modelPM5,modelMktCap,modelValTraded))),
+  Modelmetric = key, model = value)
+      
+Metrics <- c('Volatility', 'Beta_SP500', 'Gross Long', 
+  'Gross Long OnModel', 'Gross Short',
+  'Gross Short OnModel', 'Risk_Wgt_Disp', 'DivR',
+  'Factor_Rank', 'PM252', 'PM65', 'PM21', 'PM5',
+  'MktCap_$M', 'ValTraded_$M')
+      
+ExpChar <- as_tibble(cbind.data.frame(Metrics,
+  portExpChar$portfolio, modelExpChar$model))
+ExpChar <- ExpChar %>% 
+  rename(portfolio = `portExpChar$portfolio`,
+  model = `modelExpChar$model`)
+ExpChar$Metrics <- as.character(ExpChar$Metrics)
+ExpChar <- ExpChar %>% 
+  mutate('Port-Model' = portfolio - model)
+#Shiny output tibble for renderDT
+
+
+output$Exposures <- renderDT(
+  ExpChar, selection = 'single', 
+  editable = F, rownames = FALSE, 
+  caption = "Exposures", options = list(dom = 't',
+  pageLength = 20))
+output$Sensitivities <- renderDT(CorCovAggr,
+  selection = 'single', editable = F, rownames = FALSE, 
+  caption = "Sensitivities", options = list(dom = 't', 
+  pageLength = 20))})
+    
+observeEvent(input$exp, {
+    
+joinedPortRisk <- inner_join(RoRs, x$df, 
+  by = c("Ticker" = "ticker"))
+      
+#Portfolio
+covM <- joinedPortRisk %>%
+  select(-wgt) %>%
+  spread(Ticker, ror) %>%
+  select(-date) %>%
+  cov(use = "pairwise.complete.obs")
+
+
+wgt <- joinedPortRisk %>%
+  select(Ticker, wgt) %>%
+  group_by(Ticker) %>%
+  slice(1) %>%
+  ungroup() %>%
+  select(wgt)
+      
+PortVol <- sqrt(t(wgt$wgt/100) %*% covM %*%
+  wgt$wgt/100) * sqrt(252)
+      
+PortRet <- joinedPortRisk %>% 
+  mutate(rorContrib = ror * wgt/100) %>%
+  group_by(date) %>%
+  summarise(PortRet_daily = sum(rorContrib))
+      
+PortWgtWithTicker <- joinedPortRisk %>%
+  select(Ticker, wgt) %>%
+  group_by(Ticker) %>%
+  slice(1) %>%
+  ungroup()
+      
+#To get group gross/nets/stats/weights. 
+#Combine sp500beta, price momentum, and weights
+#to all_mostrecentxsection.
+
+Augmented_xsection <- left_join(ALL_mostRecentXsection,
+  BetaSec2SP500, by = 'Ticker') %>%
+  left_join(., PM, by = 'Ticker') %>%
+  left_join(., ModelWgtObject, by = 'Ticker') %>%
+  left_join(.,PortWgtWithTicker, by = 'Ticker') %>%
+  mutate(ModelWgt = ModelWgt /100, wgt = wgt /100) %>%
+  rename(PortWgt = wgt) %>%
+  mutate_if(is.numeric,~ if_else(is.na(.x),0,.x)) %>% 
+  #convert all na's to zeros for numeric columns
+  left_join(.,IndustryMap, by = 'Industry')
+      
+#Reordering columns
+Augmented_xsection <- Augmented_xsection %>% 
+  select(Ticker, L_S, submodel, Industry,
+  Industry_Name, IndBeta, SP500Beta, Price,
+  Vol, everything()) 
+      
+#Will need to use df proxy table to toggle weights in
+#PortWgt within Augmented_xsection
+      
+#Dataframe for portfolio-industry scatter-bubble x
+#ind wgt beta, s&p beta etc
+
+DF_pi <- Augmented_xsection %>% 
+  group_by(Industry_Name) %>%
+  summarise(Long_GrossWgt = sum(PortWgt[PortWgt >= 0]),
+  Short_GrossWgt = sum(PortWgt[PortWgt <=0]),
+  Net_Wgt = sum(PortWgt),
+  Long_IndBeta = PortWgt[PortWgt >= 0] %*% 
+  IndBeta [PortWgt >= 0],
+  Short_IndBeta = PortWgt[PortWgt <= 0] %*% 
+  IndBeta [PortWgt <= 0],
+  Net_IndBeta = PortWgt %*% IndBeta,
+  Long_SPBeta = PortWgt[PortWgt >= 0] %*% 
+  SP500Beta[PortWgt >= 0],
+  Short_SPBeta = PortWgt[PortWgt <= 0] %*%
+  SP500Beta[PortWgt <= 0],
+  Net_SPBeta = PortWgt %*% SP500Beta,
+  Long_Rank = PortWgt[PortWgt >= 0] %*% 
+  MedRank[PortWgt >= 0],
+  Short_Rank = PortWgt[PortWgt <= 0] %*%
+  MedRank[PortWgt <= 0],
+  Net_Rank = PortWgt %*% MedRank)
+      
+DF_pi <- DF_pi %>% 
+  mutate_at(vars(contains("Short")),
+  funs(-1*(.))) %>% mutate_if(~is.numeric(.),
+  funs(round(.,4))) #render this DT
+      
+      
+#Dataframe for portfolio-submodel scatter-bubble 
+#Will also make these DF_ objects datatables to be
+#rendered in Shiny under the bubble plots
+      
+DF_psub <- Augmented_xsection %>% 
+  group_by(submodel) %>%
+  summarise(Long_GrossWgt = sum(PortWgt[PortWgt >= 0]),
+  Short_GrossWgt = sum(PortWgt[PortWgt <=0]),
+  Net_Wgt = sum(PortWgt),
+  Long_SPBeta = PortWgt[PortWgt >= 0] %*% 
+  SP500Beta[PortWgt >= 0],
+  Short_SPBeta = PortWgt[PortWgt <= 0] %*% 
+  SP500Beta[PortWgt <= 0],
+  Net_SPBeta = PortWgt %*% SP500Beta,
+  Long_Rank = PortWgt[PortWgt >= 0] %*% 
+  MedRank[PortWgt >= 0],
+  Short_Rank = PortWgt[PortWgt <= 0] %*%
+  MedRank[PortWgt <= 0],
+  Net_Rank = PortWgt %*% MedRank,
+  Long_MktCap_Mil = (PortWgt[PortWgt >= 0] %*% 
+  MktCap[PortWgt >= 0])/1000000,
+  Short_MktCap_Mil = (PortWgt[PortWgt <= 0] %*%
+  MktCap[PortWgt <= 0])/1000000,
+  Net_MktCap_Mil = (PortWgt %*% MktCap)/1000000,
+  Long_ValTrade_Mil = (PortWgt[PortWgt >= 0] %*%
+  MedValTrade[PortWgt >= 0])/1000000,
+  Short_ValTrade_Mil = (PortWgt[PortWgt <= 0] %*% 
+  MedValTrade[PortWgt <= 0])/1000000,
+  Net_ValTrade_Mil = (PortWgt %*% MedValTrade)/1000000,
+  Long_PM252 = PortWgt[PortWgt >= 0] %*% 
+  PM252[PortWgt >= 0],
+  Short_PM252 = PortWgt[PortWgt <= 0] %*%
+  PM252[PortWgt <= 0],
+  Net_PM252 = PortWgt %*% PM252,
+  Long_PM21 = PortWgt[PortWgt >= 0] %*% 
+  PM21[PortWgt >= 0],
+  Short_PM21 = PortWgt[PortWgt <= 0] %*%
+  PM21[PortWgt <= 0],
+  Net_PM21 = PortWgt %*% PM21,
+  Long_PM5 = PortWgt[PortWgt >= 0] %*% 
+  PM5[PortWgt >= 0],
+  Short_PM5 = PortWgt[PortWgt <= 0] %*%
+  PM5[PortWgt <= 0],
+  Net_PM5 = PortWgt %*% PM5)
+
+DF_psub <- DF_psub %>% 
+  mutate_at(vars(contains("Short")),funs(-1*(.))) %>%
+  mutate_if(~is.numeric(.), funs(round(.,4))) 
+  #render this DT
+       
+#Dataframe for model-industry scatter-bubble x ind wgt,
+#beta, s&p beta etc.
+
+DF_mi <- Augmented_xsection %>% 
+  group_by(Industry_Name) %>%
+  summarise(Long_GrossWgt = sum(
+  ModelWgt[ModelWgt >= 0]),
+  Short_GrossWgt = sum(ModelWgt[ModelWgt <=0]),
+  Net_Wgt = sum(ModelWgt),
+  Long_IndBeta = ModelWgt[ModelWgt >= 0] %*% 
+    IndBeta [ModelWgt >= 0],
+  Short_IndBeta = ModelWgt[ModelWgt <= 0] %*% 
+    IndBeta [ModelWgt <= 0],
+  Net_IndBeta = ModelWgt %*% IndBeta,
+  Long_SPBeta = ModelWgt[ModelWgt >= 0] %*% 
+    SP500Beta[ModelWgt >= 0],
+  Short_SPBeta = ModelWgt[ModelWgt <= 0] %*% 
+    SP500Beta[ModelWgt <= 0],
+  Net_SPBeta = ModelWgt %*% SP500Beta,
+  Long_Rank = ModelWgt[ModelWgt >= 0] %*% 
+    MedRank[ModelWgt >= 0],
+  Short_Rank = ModelWgt[ModelWgt <= 0] %*% 
+    MedRank[ModelWgt <= 0],
+  Net_Rank = ModelWgt %*% MedRank)
+      
+DF_mi <- DF_mi %>% mutate_at(vars(contains("Short")),
+  funs(-1*(.))) %>% mutate_if(~is.numeric(.),
+  funs(round(.,4))) #render this DT
+      
+#dataframe for model-submodel scatter-bubble x ""
+DF_msub <- Augmented_xsection %>% 
+  group_by(submodel) %>%
+  summarise(Long_GrossWgt = sum(
+  ModelWgt[ModelWgt >= 0]),
+  Short_GrossWgt = sum(ModelWgt[ModelWgt <=0]),
+  Net_Wgt = sum(ModelWgt),
+  Long_SPBeta = ModelWgt[ModelWgt >= 0] %*%
+  SP500Beta[ModelWgt >= 0],
+  Short_SPBeta = ModelWgt[ModelWgt <= 0] %*%
+  SP500Beta[ModelWgt <= 0],
+  Net_SPBeta = ModelWgt %*% SP500Beta,
+  Long_Rank = ModelWgt[ModelWgt >= 0] %*%
+  MedRank[ModelWgt >= 0],
+  Short_Rank = ModelWgt[ModelWgt <= 0] %*%
+  MedRank[ModelWgt <= 0],
+  Net_Rank = ModelWgt %*% MedRank,
+  Long_MktCap_Mil = (ModelWgt[ModelWgt >= 0] %*%
+  MktCap[ModelWgt >= 0])/1000000,
+  Short_MktCap_Mil = (ModelWgt[ModelWgt <= 0] %*% 
+  MktCap[ModelWgt <= 0])/1000000,
+  Net_MktCap_Mil = (ModelWgt %*% MktCap)/1000000,
+  Long_ValTrade_Mil = (ModelWgt[ModelWgt >= 0] %*%
+  MedValTrade[ModelWgt >= 0])/1000000,
+  Short_ValTrade_Mil = (ModelWgt[ModelWgt <= 0] %*%
+  MedValTrade[ModelWgt <= 0])/1000000,
+  Net_ValTrade_Mil = (ModelWgt %*% MedValTrade)/
+  1000000,
+  Long_PM252 = ModelWgt[ModelWgt >= 0] %*% 
+  PM252[ModelWgt >= 0],
+  Short_PM252 = ModelWgt[ModelWgt <= 0] %*%
+  PM252[ModelWgt <= 0],
+  Net_PM252 = ModelWgt %*% PM252,
+  Long_PM21 = ModelWgt[ModelWgt >= 0] %*%
+  PM21[ModelWgt >= 0],
+  Short_PM21 = ModelWgt[ModelWgt <= 0] %*%
+  PM21[ModelWgt <= 0],
+  Net_PM21 = ModelWgt %*% PM21,
+  Long_PM5 = ModelWgt[ModelWgt >= 0] %*%
+  PM5[ModelWgt >= 0],
+  Short_PM5 = ModelWgt[ModelWgt <= 0] %*%
+  PM5[ModelWgt <= 0],
+  Net_PM5 = ModelWgt %*% PM5)
+      
+DF_msub <- DF_msub %>% 
+  mutate_at(vars(contains("Short")),
+  funs(-1*(.))) %>% mutate_if(~is.numeric(.),
+  funs(round(.,4)))  
+#render this DT
+      
+#2 more dataframes. These are for the 
+#(portfolio - model) gross/nets.
+      
+#industry grouping
+DF_pmmi <- as_tibble(cbind(
+  DF_pi$Industry_Name,
+  DF_pi[,2:ncol(DF_pi)] - DF_mi[, 2:ncol(DF_mi)]))
+DF_pmmi <- DF_pmmi %>%
+  rename(Industry_Name = `DF_pi$Industry_Name`)
+DF_pmmi <- DF_pmmi %>%
+  mutate(
+  Industry_Name = as.character(Industry_Name)) %>%
+  mutate_if(~is.numeric(.), funs(round(.,4)))
+#render this DT
+      
+#submodel grouping
+DF_pmms <- as_tibble(
+  cbind(DF_psub$submodel,
+  DF_psub[,2:ncol(DF_psub)] -
+  DF_msub[, 2:ncol(DF_msub)]))
+DF_pmms <- DF_pmms %>%
+  rename(submodel = `DF_psub$submodel`)  
+DF_pmms <- DF_pmms %>% 
+  mutate(submodel = as.character(submodel)) %>%
+  mutate_if(~is.numeric(.),
+  funs(round(.,4))) #render this DT
+      
+      
+#Augmented xSection formatted for DT
+Augmented_xSection_DT <- Augmented_xsection %>% 
+  mutate_at(vars(IndBeta, SP500Beta, Price), 
+  funs(round(.,2))) %>%
+  mutate_at(vars(Vol, PM252, PM65, PM21, PM5), 
+  funs(round(.,4))) %>%
+  mutate_at(vars(ModelWgt), funs(round(.,6))) %>%
+  mutate_at(vars(MedValTrade), funs(round(.,0)))
+      
+#Universe Data from Augmented_xsection object
+      
+output$UnivData <- renderDT(Augmented_xSection_DT,
+  selection = 'single', editable = F, rownames = FALSE)
+      
+#RENDER UI
+output$moreControls <- renderUI ({
+  tabsetPanel(
+  tabPanel("Portfolio by Industry", fluid = TRUE,
+  titlePanel("Long/Short/Gross/Nets"),
+  sidebarLayout(sidebarPanel(varSelectInput("xaxis_pi",
+  "Select Long:", DF_pi %>% select(contains("Long_"))),
+  varSelectInput("yaxis_pi", "Select Short:", DF_pi %>%
+  select(contains("Short_"))),
+  varSelectInput("zaxis_pi", "Select Net:", DF_pi %>%
+  select(contains("Net_")))), 
+  mainPanel(plotlyOutput("data_pi")))), 
+  tabPanel("Portfolio by Submodel", fluid = TRUE, 
+  titlePanel("Long/Short/Gross/Nets"),
+  sidebarLayout(sidebarPanel(
+  varSelectInput("xaxis_psub",
+  "Select Long:", DF_psub %>%
+  select(contains("Long_"))),
+  varSelectInput("yaxis_psub", "Select Short:",
+  DF_psub %>% select(contains("Short_"))),
+  varSelectInput("zaxis_psub", "Select Net:",
+  DF_psub %>% 
+  select(contains("Net_")))), 
+  mainPanel(plotlyOutput("data_psub")))), 
+  tabPanel("Model by Industry", fluid = TRUE, 
+  titlePanel("Long/Short/Gross/Nets"),
+  sidebarLayout(sidebarPanel(varSelectInput("xaxis_mi",
+  "Select Long:", DF_mi %>% select(contains("Long_"))),
+  varSelectInput("yaxis_mi", "Select Short:",
+  DF_mi %>% select(contains("Short_"))),
+  varSelectInput("zaxis_mi", "Select Net:",
+  DF_mi %>% select(contains("Net_")))),
+  mainPanel(plotlyOutput("data_mi")))), 
+  tabPanel("Model by Submodel", fluid = TRUE, 
+  titlePanel("Long/Short/Gross/Nets"),
+  sidebarLayout(sidebarPanel(
+  varSelectInput("xaxis_msub",
+  "Select Long:", DF_mi %>% select(contains("Long_"))),
+  varSelectInput("yaxis_msub", "Select Short:",
+  DF_mi %>% select(contains("Short_"))),
+  varSelectInput("zaxis_msub", "Select Net:",
+  DF_mi %>% select(contains("Net_")))),
+  mainPanel(plotlyOutput("data_msub")))), 
+  tabPanel("Portfolio Minus Model by Industry", 
+  fluid = TRUE, 
+  
+  titlePanel("Long/Short/Gross/Nets"),
+  sidebarLayout(sidebarPanel(
+  varSelectInput("xaxis_pmmi",
+  "Select Long:", DF_pmmi %>%
+  select(contains("Long_"))),
+  varSelectInput("yaxis_pmmi", "Select Short:", 
+  DF_pmmi %>% 
+  select(contains("Short_"))),
+  varSelectInput("zaxis_pmmi", "Select Net:", 
+  DF_pmmi %>% 
+  select(contains("Net_")))), 
+  mainPanel(plotlyOutput("data_pmmi")))), 
+  tabPanel("Portfolio Minus Model by Submodel", 
+  fluid = TRUE, 
+  
+  titlePanel("Long/Short/Gross/Nets"),
+  sidebarLayout(sidebarPanel(
+  varSelectInput("xaxis_pmms",
+  "Select Long:", DF_pmms %>%
+  select(contains("Long_"))),
+  varSelectInput("yaxis_pmms", "Select Short:", 
+  DF_pmms %>% 
+  select(contains("Short_"))),
+  varSelectInput("zaxis_pmms", "Select Net:",
+  DF_pmms %>% select(contains("Net_")))), 
+  mainPanel(plotlyOutput("data_pmms")))))})
+
+#Feature selector for gross/nets plots
+      
+#DF_pi output
+output$data_pi <- renderPlotly({
+  p<-ggplot(DF_pi, aes(x= !!input$xaxis_pi,
+  y = !!input$yaxis_pi, size = !!input$zaxis_pi,
+  color = Industry_Name)) + geom_point() 
+  ggplotly(hide_legend(p))})
+        
+#DF_psub output
+output$data_psub <- renderPlotly({
+  p<-ggplot(DF_psub, aes(x= !!input$xaxis_psub,
+  y = !!input$yaxis_psub, size = !!input$zaxis_psub,
+  color = submodel)) + geom_point() 
+  ggplotly(p) #can decide whether to keep legend later
+  })
+        
+#DF_mi output
+output$data_mi <- renderPlotly({
+  p<-ggplot(DF_mi, aes(x= !!input$xaxis_mi, 
+  y = !!input$yaxis_mi, size = !!input$zaxis_mi, 
+  color = Industry_Name)) + geom_point() 
+  ggplotly(hide_legend(p))})
+        
+#DF_msub output
+output$data_msub <- renderPlotly({
+  p<-ggplot(DF_msub, aes(x= !!input$xaxis_msub,
+  y = !!input$yaxis_msub, size = !!input$zaxis_msub,
+  color = submodel)) + geom_point() 
+  ggplotly(p)})
+        
+        
+#DF_pmmi output
+output$data_pmmi <- renderPlotly({
+  p<-ggplot(DF_pmmi, aes(x= !!input$xaxis_pmmi,
+  y = !!input$yaxis_pmmi, size = !!input$zaxis_pmmi,
+  color = Industry_Name)) + geom_point() 
+  ggplotly(hide_legend(p))})
+        
+#DF_pmms output
+output$data_pmms <- renderPlotly({
+  p<-ggplot(DF_pmms, aes(x= !!input$xaxis_pmms,
+  y = !!input$yaxis_pmms, size = !!input$zaxis_pmms,
+  color = submodel)) + geom_point() 
+  ggplotly(p)
+  #can decide whether to keep legend later
+  })#end plot feature toggler
+})  #end exp action button
+      
+observeEvent(input$sims, {
+  x$df = x$df
+  replaceData (proxy, x$df, resetPaging = FALSE)
+  joinedPortRisk <- suppressWarnings(inner_join(RoRs,
+  x$df, by = c("Ticker" = "ticker")))
+  testRoR <- joinedPortRisk %>%
+  select(-wgt) %>%
+  spread(Ticker, ror) %>%
+  select(-date)
+      
+wgt <- joinedPortRisk %>%
+  select(Ticker, wgt) %>%
+  group_by(Ticker) %>%
+  slice(1) %>%
+  ungroup() %>%
+  select(wgt)
+
+covM <- joinedPortRisk %>%
+  select(-wgt) %>%
+  spread(Ticker, ror) %>%
+  select(-date) %>%
+  cov(use = "pairwise.complete.obs")
+
+fit <- fit.mst(testRoR, method = "BFGS")
+Sigma <- as.matrix(fit$Sigma)
+nu <- fit$df
+
+#1-day return simulations
+VAR5_cut <- round(.05*input$nSim,0)
+      
+#input$nSim is the number of simulations to run. 
+#Expect input$nSim number of rows in sample_
+
+sample_mvlaplace <- LaplacesDemon::rmvl(input$nSim,
+  rep(0,nrow(covM)), covM)
+#mv laplace returns generator
+sample_mvnormal <- LaplacesDemon::rmvn(input$nSim,
+  rep(0, nrow(covM)), covM )
+#mv normal returns generator
+sample_mvst <- LaplacesDemon::rmvt(input$nSim, 
+  rep(0, nrow(covM)), Sigma, nu)
+#mv student t returns generator
+      
+#Simulations for 1-day histograms 
+#Expect input$nSim number of rows and 1 column of 
+#portfolio returns in sim_
+
+sim_mvlaplace <- sample_mvlaplace[1:input$nSim,] %*%
+  (wgt$wgt/100) #mv laplace portfolio simulation
+sim_mvnormal <- sample_mvnormal[1:input$nSim,] %*% 
+  (wgt$wgt/100) #mv normal portfolio simulation
+sim_mvst <- sample_mvst[1:input$nSim,] %*% 
+  (wgt$wgt/100) #mv student t portfolio simulation
+
+#Laplace simVar
+VAR5_laplace <- sim_mvlaplace[order(
+sim_mvlaplace)][1:VAR5_cut]
+VAR5_laplace_unconditional <- VAR5_laplace[VAR5_cut]
+VAR5_laplace_conditional <- mean(
+VAR5_laplace[1:VAR5_cut])
+
+#Normal simVar
+VAR5_normal <- sim_mvnormal[order(
+sim_mvnormal)][1:VAR5_cut]
+VAR5_normal_unconditional <- VAR5_normal[VAR5_cut]
+VAR5_normal_conditional <- mean(
+VAR5_normal[1:VAR5_cut])
+
+#Student T simVar
+VAR5_T <- sim_mvst[order(sim_mvst)][1:VAR5_cut]
+VAR5_T_unconditional <- VAR5_T[VAR5_cut]
+VAR5_T_conditional <- mean(VAR5_T[1:VAR5_cut])      
+
+#Multiperiod return simulations
+sample_mvlaplace_ts <- NULL
+sample_mvnormal_ts <- NULL
+sample_mvst_ts <- NULL
+      
+#Create a list of matrices that hold the sampled 
+#return data. The object should have the
+#following dimensions:
+#nSim_ts x [nDays x numsecurities]
+
+for  (i in 1:input$nSim_ts) {
+
+sample_mvlaplace_ts_temp <- (
+LaplacesDemon::rmvl(input$nDays,
+rep(0,nrow(covM)), covM)) 
+#mv laplace returns generator
+sample_mvnormal_ts_temp <- (
+LaplacesDemon::rmvn(input$nDays,
+rep(0, nrow(covM)), covM)) 
+#mv normal returns generator
+sample_mvst_ts_temp <- (
+LaplacesDemon::rmvt(input$nDays,
+rep(0, nrow(covM)), Sigma, nu))
+#mv student t returns generator
+        
+sample_mvlaplace_ts[[i]] <- sample_mvlaplace_ts_temp
+
+sample_mvnormal_ts[[i]] <- sample_mvnormal_ts_temp
+
+sample_mvst_ts[[i]] <- sample_mvst_ts_temp}
+
+#Create a list of the list of matrices 
+#[[simulation type]] [[simulation number]]
+
+sample_ts <- list(
+  "sample_mvlaplace_ts"=sample_mvlaplace_ts,
+  "sample_mvnormal_ts"=sample_mvnormal_ts,
+  "sample_mvst_ts" = sample_mvst_ts)
+      
+#Create nSim_ts number of portfolio simulations 
+#for each of the three simulation types
+
+sims_ts_ports <- lapply(1:length(sample_ts), 
+  function (y) {
+  lapply(1:input$nSim_ts, function (x) {
+  sample_ts[[y]][[x]] %*% (wgt$wgt/100)})}) 
+      
+#Unlist the list of matrices to a list of three 
+#larger lists with each of the nSim_ts
+#simulations combined.
+
+sims_ts_ports_unlist <- lapply(1:length(sims_ts_ports),
+  function(z) {unlist(sims_ts_ports[[z]])})
+
+#Turn the three larger lists back to a list of 3
+#matrices of the correct dimension.
+
+sims_ts_ports_unlist <- lapply(
+  1:length(sims_ts_ports_unlist),
+  function (q){matrix(sims_ts_ports_unlist[[q]],
+  nrow = input$nDays, ncol = input$nSim_ts)})
+
+#Convert to a list of 3 xts objects with dummy 
+#dates binded.
+
+dummyDates <- lapply(sims_ts_ports_unlist,
+  function(a){
+  (order.by = as.Date(
+  1:nrow(sims_ts_ports_unlist[[1]])))})
+
+sims_ts_ports_unlist_xts <- lapply(
+  1:length(sims_ts_ports_unlist), 
+  function(b){xts(sims_ts_ports_unlist[[b]],
+  order.by = dummyDates[[b]])})
+
+#Distribution of nSim_ts number of drawdowns for each 
+#of the three simulation types
+
+sims_ts_ports_maxDrawdowns <-lapply(
+  1:length(sims_ts_ports_unlist_xts),
+  function(c) {
+  maxDrawdown(sims_ts_ports_unlist_xts[[c]])})
+      
+#Giving each simulation of drawdowns a name for 
+#each type of simulation. Can call each
+#by $ for histograms
+
+#rename for book display purposes
+
+sims_tspmDD<- sims_ts_ports_maxDrawdowns
+
+sims_tspmDD <- (list(
+  "sim_drawdowns_Laplace" = sims_tspmDD[[1]],
+  "sim_drawdowns_Normal" = sims_tspmDD[[2]],
+  "sim_drawdowns_T" = sims_tspmDD[[3]]))
+      
+#Maximum drawdown analysis:
+#Cutoff for the worst 5% of maximum drawdowns
+#in the simulations
+
+DD5_cut <- round(.95*input$nSim_ts,0) + 1
+      
+#Laplace simVar TS
+DD5_laplace <- sims_tspmDD$sim_drawdowns_Laplace[
+  order(sims_tspmDD$sim_drawdowns_Laplace)][
+  DD5_cut:input$nSim_ts]
+DD5_laplace_unconditional <- DD5_laplace[1]
+DD5_laplace_conditional <- mean(DD5_laplace[1:(
+  input$nSim_ts - DD5_cut + 1)])
+      
+#Normal simVar TS
+DD5_normal <- sims_tspmDD$sim_drawdowns_Normal[
+  order(sims_tspmDD$sim_drawdowns_Normal)][
+  DD5_cut:input$nSim_ts]
+DD5_normal_unconditional <- DD5_normal[1]
+DD5_normal_conditional <- mean(DD5_normal[
+  1:(input$nSim_ts - DD5_cut + 1)])
+      
+#Student T simVar TS
+DD5_T <- sims_tspmDD$sim_drawdowns_T[
+  order(sims_tspmDD$sim_drawdowns_T)][
+  DD5_cut:input$nSim_ts]
+DD5_T_unconditional <- DD5_T[1]
+DD5_T_conditional <- mean(DD5_T[1:(
+input$nSim_ts - DD5_cut + 1)])
+      
+observe({simType = input$simType
+      
+#Toggle Plot and Data Output based on user selected
+#probability distribution (1-day VAR and
+#n-Day max drawdown distributions).
+
+if (simType == "Laplace") {
+output$sim_data <- renderPlot(hist(sim_mvlaplace,
+  main = "1-day Sim of MultiVar Laplace Returns",
+  xlab = NULL))
+  output$sim_nday_data <- renderPlot(
+  hist(sims_tspmDD$sim_drawdowns_Laplace,
+  main = "Multiperiod Sim of MultiVar Laplace DD",
+  xlab = NULL))
+  output$sim_summary <- renderPrint(
+  cat("Unconditional VAR5:",
+  round(VAR5_laplace_unconditional,4), "|",
+  "Conditional VAR5:",
+  round(VAR5_laplace_conditional,4)))
+  output$sim_nday_summary <-renderPrint(
+    cat("Unconditional MAXDD5:",
+  round(DD5_laplace_unconditional,4), "|",
+  "Conditional MAXDD5:",
+  round(DD5_laplace_conditional,4)))}
+else if (simType == "Normal") {
+output$sim_data <- renderPlot(hist(sim_mvnormal,
+  main = "1-day Sim of MultiVar Normal Returns",
+  xlab = NULL))
+  output$sim_nday_data <- renderPlot(
+  hist(sims_tspmDD$sim_drawdowns_Normal,
+  main = "Multiperiod Sim of MultiVar Normal DD",
+  xlab = NULL))
+output$sim_summary <- renderPrint(cat(
+  "Unconditional VAR5:",
+  round(VAR5_normal_unconditional,
+  4), "|", "Conditional VAR5:", 
+  round(VAR5_normal_conditional,4)))
+output$sim_nday_summary <-renderPrint(cat(
+  "Unconditional MAXDD5:",
+  round(DD5_normal_unconditional,
+  4), "|",
+  "Conditional MAXDD5:",
+  round(DD5_normal_conditional,4)))
+  }
+else if ( simType == "Student_T") {
+  output$sim_data <- renderPlot(hist(sim_mvst,
+  main = "1-day Sim of MultiVar Student-T Returns",
+  xlab = NULL))
+  output$sim_nday_data <- renderPlot(
+  hist(sims_tspmDD$sim_drawdowns_T,
+  main = (
+  "Multiperiod Sim of MultiVar Student-T Drawdowns"),
+  xlab = NULL))
+output$sim_summary <- renderPrint(cat(
+  "Unconditional VAR5:",
+  round(VAR5_T_unconditional,4), "|",
+  "Conditional VAR5:", round(VAR5_T_conditional,4)))
+output$sim_nday_summary <-renderPrint(cat(
+  "Unconditional MAXDD5:",
+  round(DD5_T_unconditional,4), "|",
+  "Conditional MAXDD5:", round(DD5_T_conditional,4)))}
+
+}) 
+#End observe simType change that triggers
+#the logic that changes the histograms without
+#recalculating the full simulation.
+     
+})  
+#end ObserveEvent that is triggered by pressing the 
+#simulation button. This reruns all simulations.
+    
+observeEvent(input$add_btn, {
+  x$df = rbind(data.frame(
+  ticker = input$ticker,wgt = input$wgt),
+  x$df)
+  x$df
+replaceData (proxy, x$df, resetPaging = FALSE,
+rownames = TRUE)
+    
+}) 
+#End inserting new ticker updating the full table.
+    
+observeEvent(input$delete_btn, {
+  x$df = x$df
+  print(nrow(x$df))
+  if (!is.null(input$shiny_table_rows_selected)) {
+  x$df <- x$df[-as.numeric(
+  input$shiny_table_rows_selected),]
+  }
+x$df
+replaceData (proxy, x$df, resetPaging = FALSE,
+rownames = TRUE)
+    
+})  
+#End delete portfolio holdings row updating full table.
+    
+    
+observeEvent(input$shiny_table_cell_edit, {
+  info = input$shiny_table_cell_edit
+  str(info)
+      
+i = info$row
+j = info$col
+v = info$value
+
+x$df[i, j] <- isolate(DT::coerceValue(
+  v, x$df[i, j]))
+replaceData (proxy, x$df, resetPaging = FALSE,
+  rownames = TRUE)
+}) 
+#End portfolio cell edits updating full table.
+    
+observeEvent(input$char, {
+  x$df = x$df
+  replaceData (proxy, x$df, resetPaging = FALSE)
+      
+joinedPortRisk <- suppressWarnings(inner_join(RoRs,
+  x$df, by = c("Ticker" = "ticker")))
+      
+covM <- joinedPortRisk %>%
+  select(-wgt) %>%
+  spread(Ticker, ror) %>%
+  select(-date) %>%
+  cov(use = "pairwise.complete.obs")
+      
+wgt <- joinedPortRisk %>%
+  select(Ticker, wgt) %>%
+  group_by(Ticker) %>%
+  slice(1) %>%
+  ungroup() %>%
+  select(wgt)
+      
+PortVol <- sqrt(t(wgt$wgt/100) %*% covM %*%
+  wgt$wgt/100) * sqrt(252)
+      
+PortRet <- joinedPortRisk %>% 
+  mutate(rorContrib = ror * wgt/100) %>%
+  group_by(date) %>%
+  summarise(PortRet_daily = sum(rorContrib))
+      
+MCTR <- (wgt$wgt/100) %*% covM /
+  (PortVol[1,1] /sqrt (252))
+RiskContrib <- (MCTR * (wgt$wgt/100)) /
+  (PortVol[1,1] / sqrt(252))
+RiskContrib <- 100* round(RiskContrib,3)
+RiskContrib <- as_tibble(cbind(
+  rownames(t(RiskContrib)),
+  t(RiskContrib)))
+RiskContrib <- RiskContrib %>% 
+  rename ("Ticker" = "V1", "RiskContrib" = "V2")
+      
+#Render risk contribution table
+output$shiny_table_sum <- renderDT(RiskContrib, 
+  selection = 'single', editable = F, rownames = FALSE)
+      
+#Write latest holdings to csv
+  write.csv(x$df, "newHoldings.csv")
+      
+}) 
+#End code for characteristics triggered
+#by button press.
+
+}) 
+#End main function observer. 
+}
+
+shinyApp(ui = ui, server = server)
+```
+
+

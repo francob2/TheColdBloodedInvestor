@@ -1,0 +1,1208 @@
+---
+output:
+  pdf_document: default
+  html_document: default
+---
+# Code Flows in R
+
+Let us begin by running the model in production. This means that we are going to calcuate fundamental factor returns using 12 months of factor exposure data, utilize a simple weighting scheme that, together with the latest raw factor values, are used to generate fundamental security ranks. These ranks will take on a value of [1,2,3], with 3 being the highest fundamental factor rank. We will then *layer on* three subranks based on the mean reversion component of the model and exclude the middle ranks. Thus, of the nine possible scores [11, 12, 13, 21, 22, 23, 31, 32, 33], that result in nine baskets of securities, we will only consider the 11s and 33s. The 11s represent the lowest fundamentally ranked securities with the highest propensity for downward short-term mean reversion. Those are our short candidates. The 33s are merely the reverse circumstance. 
+
+In the code that follows, please note that we will not be able to show raw data, as it is property of Bloomberg Finance L.P. However, we *are* able to show the *structure* of the data, and have been given permission to display *derived* data. We will see some derived data when there are no fields in the dataframes that contain raw data. Thus, what follows is not a fully reproducible example. Some authors might argue that not having a fully reproducible example is bad form, but perhaps there is a net benefit in being able to show realistic values in the output. We use R version 3.6.0. in the code that follows. 
+
+```{r LoadAndTransData, eval=TRUE, results = 'asis', echo=TRUE, message=FALSE, warning=FALSE, cache = FALSE, tidy = FALSE}
+
+#Load Required Libraries
+
+#For connecting to SQL Server
+library(RODBC) 
+
+#SQL manipulation in R
+library(DBI) 
+
+#More packages
+library(tidyquant) 
+library(magrittr) 
+library(tibbletime) 
+library(gridExtra) 
+library(scales)
+library(formatR)
+
+#If we needed to pull raw data from a database
+#this is how we would do it:
+
+# Database Connection 
+## Connect to the Database
+#con <- DBI::dbConnect(odbc::odbc(),
+  #Driver    = "SQL Server", 
+  #Server    = "ServerName",
+  #Database  = "DatabaseName",
+  #UID       = "InsertOnlyUser",
+  #PWD       = "MyPwd",
+  #Port      = 1433)
+
+#Read in last 12 months worth of raw 
+#quantamental data from monthly database
+#using embedded SQL code, that can be written 
+#in an R script, that is made possible by the
+#great DBI package.
+
+#BBG_fund_est_dates <- dbGetQuery(con, 
+  #"SELECT Date FROM Franco_BBG_Fund_Est_Monthly")
+#BBG_fund_est_dates <- BBG_fund_est_dates %>%
+ # filter(Date != '2019-11-01')
+
+#BBG_fund_est_dates <- BBG_fund_est_dates %>% 
+ # as_tibble() %>% 
+  #mutate(Date = as.Date(Date)) %>% 
+  #distinct() %>% 
+  #arrange(desc(Date)) %>% 
+  #select(Date) %>% 
+  #filter(row_number() == 13)
+
+#BBG_fund_est_monthly <- dbGetQuery(con,
+ # paste0(
+  #" SELECT * FROM Franco_BBG_Fund_Est_Monthly
+#  WHERE Date >=     
+ # '",BBG_fund_est_dates$Date,"'"))
+
+#BBG_fund_est_monthly <- BBG_fund_est_monthly %>%
+ #   filter(Date != '2019-11-01')
+
+#For this book, we will make things easier
+#and just read from a csv
+
+read_bbg_monthly <- read_csv("bbg_monthly.csv")
+
+#Let us peek at the structure of this data.
+#We will use R's handy str() function, but include the 
+#argument vec.len = 0 to suppress any data from being 
+#seen. Remember, later on we will not suppress 
+#the derived data.
+
+str(read_bbg_monthly, vec.len = 0)
+
+BBG_fund_est_dates <- read_bbg_monthly %>%
+  mutate(Date = as.Date(Date, "%m/%d/%Y")) %>%
+  select(Date) %>%
+  filter(Date != '2019-11-01') %>%
+  distinct() %>%
+  arrange(desc(Date)) %>%
+  filter(row_number()==13)
+
+BBG_fund_est_monthly <- read_bbg_monthly %>%
+  mutate(Date = as.Date(Date, "%m/%d/%Y")) %>%
+  filter(Date >= BBG_fund_est_dates) %>%
+  filter(Date != '2019-11-01')
+
+#read in tickers from last month 
+TickerSet <- BBG_fund_est_monthly %>% 
+  filter(Date == max(Date)) %>% 
+  select(Ticker)
+
+TickerSet <- as.character(TickerSet$Ticker)
+
+TickerSet_Yahoo <- gsub(" US Equity", "", TickerSet, 
+  ignore.case = T)
+
+#The following code can be used to get 
+#historical prices from Yahoo. 
+#We have commented it out
+
+#PX_Yahoo <- tq_get(TickerSet_Yahoo,
+#get = "stock.prices", 
+#from = "2017-10-9", to = "2019-10-25")
+#PX_Yahoo <- PX_Yahoo %>% select(
+#symbol, date, adjusted) %>%
+#mutate(symbol = paste(symbol, "US Equity"))
+
+#write_csv(PX_Yahoo, "pxyahoo.csv")
+#Reading in the file generated from the output of the
+#commented code above:
+
+PX_Yahoo <- read_csv("pxyahoo.csv")
+ 
+BBG_fund_est_monthly <- BBG_fund_est_monthly %>%
+  mutate(DATE = ymd(Date)) %>%
+  as_tibble() %>%
+  tbl_time(index = DATE)
+
+BBG_fund_est_monthly <- inner_join(
+  BBG_fund_est_monthly, 
+  PX_Yahoo, by = c(
+  "Ticker" = "symbol", "DATE" = "date")) %>%
+  select(-PX_LAST, -Date) 
+
+BBG_fund_est_monthly <- BBG_fund_est_monthly %>% 
+  rename(PX_LAST = adjusted)
+
+#Note that within a month, say August, we will be
+#computing forward returns for previous year 
+#August through current year end of July 
+#(12 months), so last date will be July in this
+#tibble.
+#On the first business day of the month, say, 
+#August we won't have yahoo prices for August 1st
+#in this case, so the number of forward returns
+#will be 11, not 12.
+
+BBG_fund_est_monthly <- BBG_fund_est_monthly %>% 
+  arrange(DATE) %>%
+  group_by(Ticker) %>%
+  arrange(DATE) %>%
+  mutate(PRET_T1M = PX_LAST / dplyr::lag(PX_LAST,1) -1, 
+  PRET_F1M = lead(PX_LAST,1)/ PX_LAST -1) %>%
+#introduce a date difference test to find securities 
+#that have gaps in availability
+  mutate(ddiff_fwd = as.numeric(lead(DATE,1) - DATE, 
+  unit = "days"), 
+  ddiff_back = as.numeric(DATE - dplyr::lag(DATE,1), 
+  unit = "days")) %>% 
+#mutate raw returns values based on date difference
+#logic
+  mutate(PRET_T1M = case_when((ddiff_back > 40) ~ 
+  as.numeric(NA), TRUE ~ PRET_T1M), 
+  PRET_F1M = case_when((ddiff_fwd > 40) ~ 
+  as.numeric(NA),TRUE ~ PRET_F1M)) %>%
+#remove unreasonable monthly returns i.e. greater than
+#1000%
+  filter(PRET_F1M < 10) %>%
+#mutate sector-model assignment
+  ungroup() %>%
+  mutate(submodel = case_when((GICS_Sector == 10 | 
+  GICS_Sector == 15 | GICS_Sector == 20)
+  ~ as.character("Cyclicals"), (GICS_Sector == 60 | 
+  GICS_Sector == 55 | GICS_Sector == 40)
+  ~ as.character("Intsen"), (GICS_Sector == 35 | 
+  GICS_Sector == 45 | GICS_Sector == 50)
+  ~ as.character("FastGrowth"), (GICS_Sector == 25 | 
+  GICS_Sector == 30) ~ 
+  as.character("StableGrowth")))
+
+#Mutate calculation of raw factor values
+#Note for EstRev we put 100% wgt on FY2 if available,
+#otherwise we put 100% wgt on FY1.
+#This is an imperfect workaround to dealing with 
+#very messy date math that comes from weighting by
+#where a company is in its fiscal year; but we
+#nevertheless, capture the spirit of the factor.
+
+BBG_fund_est_monthly <- BBG_fund_est_monthly %>% 
+  mutate(EstRev = case_when(!is.na(
+  BEst_EPS_4Wk_pct_Chg_FY2) 
+  ~ BEst_EPS_4Wk_pct_Chg_FY2, 
+  is.na(BEst_EPS_4Wk_pct_Chg_FY2) ~ 
+  BEst_EPS_4Wk_pct_Chg_FY1), 
+  BP = Bk_Val_Per_Sh_LF/ PX_LAST, 
+  FEP = BEst_EPS_FY1 / PX_LAST, ROE = ROE_LF, 
+  CFP = CPS_T12M / PX_LAST, 
+  CashIncR = CPS_T12M / EPS_T12M, 
+  TEP = EPS_T12M / PX_LAST, 
+  SalesGr = BEst_Sales_YoY_FY0_FY1) %>%
+  select(-Bk_Val_Per_Sh_LF, - BEst_EPS_FY2,
+  -BEst_EPS_FY1, 
+  -BEst_EPS_4Wk_pct_Chg_Q, 
+  -BEst_EPS_4Wk_pct_Chg_FY1,-BEst_EPS_4Wk_pct_Chg_FY2, 
+  -BEst_Sales_YoY_FY0_FY1, 
+  -ROE_LF, -CPS_T12M, -EPS_T12M, -PX_LAST,
+  -ddiff_fwd, -ddiff_back)
+
+#Calculate industry-relative ranks regardless of model 
+#inclusion-exclusion, cross sectionally by 
+#date & tertiles
+
+Ind_Rel_Rank <- BBG_fund_est_monthly %>%
+  group_by(DATE, GICS_Ind) %>%
+  mutate_at(c("EstRev", "BP", "FEP", "ROE", "CFP", 
+  "CashIncR", "TEP", "SalesGr"), 
+  ~ntile(.,3))
+
+#Gather to create exposures with in/out toggles.
+#If/else coupled with na.omit at end on 
+#long/gathered data 
+#should synthetically create proper factor assignment.
+
+Ind_Rel_Rank_long <- Ind_Rel_Rank %>% 
+  ungroup() %>%
+  select(Ticker,DATE, PRET_F1M, submodel,
+  GICS_Ind, GICS_Sector, 
+  c("EstRev", "BP", "FEP", "ROE", "CFP", "CashIncR", 
+  "TEP", "SalesGr")) %>%
+  gather(key=Factors, value= Ranking, -DATE, -Ticker,
+  -PRET_F1M, -submodel, -GICS_Sector, -GICS_Ind) %>%
+  mutate(Ranking = ifelse(Factors == "SalesGr" & 
+  submodel == "Cyclicals",NA, Ranking),
+  Ranking = ifelse(Factors == "SalesGr" & 
+  submodel == "Intsen", NA, Ranking),
+  Ranking = ifelse(Factors == "TEP" & 
+  submodel == "Intsen", NA, Ranking),
+  Ranking = ifelse(Factors == "TEP" & 
+  submodel == "Cyclicals", NA, Ranking),
+  Ranking = ifelse(Factors == "TEP" & 
+  submodel == "FastGrowth", NA, Ranking),
+  Ranking = ifelse(Factors == "FEP" & 
+  submodel == "Cyclicals", NA, Ranking),
+  Ranking = ifelse(Factors == "FEP" & 
+  submodel == "StableGrowth", NA, Ranking),
+  Ranking = ifelse(Factors == "CFP" & 
+  submodel == "Intsen", NA, Ranking),
+  Ranking = ifelse(Factors == "CashIncR" & 
+  submodel == "Intsen", NA, Ranking),
+  Ranking = ifelse(Factors == "ROE" & 
+  submodel == "Cyclicals", NA, Ranking),
+  Ranking = ifelse(Factors == "ROE" & 
+  submodel == "FastGrowth", NA, Ranking),
+  Ranking = ifelse(Factors == "BP" & 
+  submodel == "FastGrowth", NA, Ranking)) %>%
+  na.omit()
+
+testing <- Ind_Rel_Rank_long %>% 
+  arrange(DATE,GICS_Ind,Factors,Ranking)
+
+#Create average Factor ranked return by 
+#Date and Industry.
+#Remove middle tertile (2).
+#Spread to get columns of tertile 3 and 1.
+#Mutate to get difference (tertiles 3 - 1)
+#Get the average factor spread across all industries.
+#Drop spread columns.
+#Regroup and calculate average spread ACROSS industries
+#for a given factor for a given date.
+
+aa<-testing %>% 
+  group_by(DATE,GICS_Ind,Factors,Ranking) %>%
+  summarise(avgFactRankRet = mean(PRET_F1M)) %>%
+  ungroup() %>%
+  filter(Ranking != "2") %>%
+  spread(Ranking, avgFactRankRet) %>%
+  rename(T1 = '1', T3 = '3') %>% 
+  mutate(T31sprd = T3 - T1) %>%
+  select(-T1, -T3) %>%
+  na.omit() %>%
+  group_by(DATE,Factors) %>%
+  summarise(avgT31sprd = mean(T31sprd))
+
+#Now we need rolling performance of the avgT31sprd
+#for each factor to determine rolling weights.
+#Create rolling functions (rolling average factor
+#return and rolling average factor Sharpes)
+#using window = 12. This will be 12 months. Must
+#change window to 11 on first day of month.
+
+rollSprdRet <- rollify(function(returns) {
+  trailSprd = mean(returns)}, 
+  window = 12)
+
+#Group by Factors and call the functions.
+#If run in, say, August, average spreads will be
+#through July. Again, must change window to 11
+#on first day of month based on joining logic
+#and the fact that we use previous business 
+#day close from Yahoo Finance 
+
+RollAA <- aa %>% group_by(Factors) %>%
+  mutate(trailSprdRet = rollSprdRet(avgT31sprd)) %>%
+  na.omit() %>%
+  ungroup()
+
+joinRollFactorPerf <- testing %>% 
+  left_join(.,RollAA) 
+
+joinRollFactorPerf <- joinRollFactorPerf %>% 
+  group_by(DATE, Ticker) %>%
+  mutate(FactorCt = n_distinct(Factors)) %>% 
+  #factor counts. would do submodel group 
+  #but some securities might not have data for a factor 
+  #so gross up weights to guarantee sum to 1
+  group_by(DATE,Ticker) %>%
+  mutate(tsprdRetRank = ntile(
+  trailSprdRet, n = FactorCt)) %>%  
+  #ranks based on avg returns
+  mutate(FactorWgt_ret = tsprdRetRank /
+  sum(tsprdRetRank)) 
+  #weights based on return ranks
+```
+
+The code that has been run up until this point essentially transformed raw financial data to calculate historical factor exposures and monthly factor returns. We then used those factor returns to calculate factor weights. In the resulting output, we remove the non-derived (original Bloomberg) data. Let us look glimpse at this output: 
+
+```{r ViewWeights, eval=TRUE, echo=TRUE, message=FALSE, warning=FALSE, cache = FALSE, tidy = FALSE}
+
+#By Ticker and Factor
+#The weightings are given by the last column,
+#FactorWgt_ret and represent the weights to 
+#be applied for the entire month of October in
+#2019. The DATE output of 2019-09-03 is a little
+#misleading because one might think the resulting
+#weights should be applied to September, but that
+#is an artifact of using forward one month returns
+#in the factor return estimation. In other words,
+#data up until the first date in September was
+#used to calculate the factor returns for all of
+#September, and the resulting weights begin to be
+#applied in October. Note also, FactorWgt_ret is
+#a factor weight, NOT a factor-weighted return.
+#The _ret just refers to the fact that the weight
+#is derived from the factor returns
+
+#Here are the first 20 rows of output:
+joinRollFactorPerf %>% 
+  ungroup() %>%
+  mutate(Ticker = str_replace(
+  Ticker, " US Equity", "")) %>%
+  select(Ticker,DATE,Factors,FactorWgt_ret) %>%
+  arrange(Ticker,Factors) %>%
+  na.omit() %>%
+  print(20)
+
+
+ 
+```
+
+We now have the weights to be applied to every factor for every security. But we also need to obtain the factor exposures for every security for just the most recent business day. We will eventually combine the weights and exposures to arrive at a composite fundamental security rank.
+
+```{r GetMRDExp, eval=TRUE, echo=TRUE, message=FALSE, warning=FALSE, cache = FALSE, tidy = FALSE}
+
+#Get most recent closing date's raw fundamentals and
+#estimate data.
+
+#Here is an incredibly useful package created by 
+#Whit Armstrong, Dirk Eddelbuettel, and John Laing
+#It is called Rblpapi and it is R's interface
+#to 'Bloomberg'. The code is commented out, but it
+#can be used to pull point-in-time data that lives
+#in a screen referenced by the first argument in 
+#the beqs() function. For this example, we use
+#data that was written to csv.
+
+#library(Rblpapi)
+MR_CLOSE_DATE <- max(PX_Yahoo$date)
+
+#blpConnect()
+#eqs_fund_est_daily <- beqs("univ_univ_med_w_factors",
+#date = MR_CLOSE_DATE)
+
+eqs_fund_est_daily <- read_csv(
+  "eqs_fund_est_daily.csv")
+
+#column renaming for readability. 
+#Raw bloomberg fields display rather cryptic
+#headings
+
+colnames(eqs_fund_est_daily) <- str_replace_all(
+colnames(eqs_fund_est_daily),
+  "date", "Date")
+colnames(eqs_fund_est_daily) <- str_replace_all(
+colnames(eqs_fund_est_daily), 
+  "Short.Name", "Short_Name")
+colnames(eqs_fund_est_daily) <- str_replace_all(
+colnames(eqs_fund_est_daily),
+  "Price.D.1", "PX_LAST")
+colnames(eqs_fund_est_daily) <- str_replace_all(
+colnames(eqs_fund_est_daily), 
+  "Market.Cap", "Market_Cap")
+
+#This field, along with others that follow
+#have to be split up and concatenated for book
+#display purposes.
+
+colnames(eqs_fund_est_daily) <- str_replace_all(
+colnames(eqs_fund_est_daily),
+paste0(
+  "Seqential.Rank...Higher.is.Better.Median.of.Daily.",
+  "Price.over.",
+  "65.Days...Median.of.Daily.Volume.over.65.Days."),
+"med_vol")
+colnames(eqs_fund_est_daily) <- str_replace_all(
+colnames(eqs_fund_est_daily),
+  "GICS.Sector", "GICS_Sector")
+colnames(eqs_fund_est_daily) <- str_replace_all(
+colnames(eqs_fund_est_daily),
+  "GICS.Ind", "GICS_Ind")
+colnames(eqs_fund_est_daily) <- str_replace_all(
+colnames(eqs_fund_est_daily),
+  "Bk.Val.Per.Sh.LF", "Bk_Val_Per_Sh_LF")
+colnames(eqs_fund_est_daily) <- str_replace_all(
+colnames(eqs_fund_est_daily),
+  "BEst.EPS.4Wk...Chg.Y.1", "BEst_EPS_4Wk_pct_Chg_FY2")
+colnames(eqs_fund_est_daily) <- str_replace_all(
+colnames(eqs_fund_est_daily),
+  "BEst.EPS.Y.1", "BEst_EPS_FY2")
+colnames(eqs_fund_est_daily) <- str_replace_all(
+colnames(eqs_fund_est_daily),
+  "BEst.EPS.Y", "BEst_EPS_FY1")
+colnames(eqs_fund_est_daily) <- str_replace_all(
+colnames(eqs_fund_est_daily),
+  "EPS.T12M", "EPS_T12M")
+colnames(eqs_fund_est_daily) <- str_replace_all(
+colnames(eqs_fund_est_daily),
+  "BEst.EPS.4Wk...Chg.Q", "BEst_EPS_4Wk_pct_Chg_Q")
+colnames(eqs_fund_est_daily) <- str_replace_all(
+colnames(eqs_fund_est_daily),
+  "BEst.EPS.4Wk...Chg.Y", "BEst_EPS_4Wk_pct_Chg_FY1")
+colnames(eqs_fund_est_daily) <- str_replace_all(
+colnames(eqs_fund_est_daily),
+ "ROE.LF", "ROE_LF")
+colnames(eqs_fund_est_daily) <- str_replace_all(
+colnames(eqs_fund_est_daily),
+  "CPS.T12M", "CPS_T12M")
+colnames(eqs_fund_est_daily) <- str_replace_all(
+colnames(eqs_fund_est_daily),
+  "Shares.Out.LF", "Shares_Out_LF")
+colnames(eqs_fund_est_daily) <- str_replace_all(
+colnames(eqs_fund_est_daily),
+  "BEst.Sales.YoY.Gr.Y", "BEst_Sales_YoY_FY0_FY1")
+
+eqs_fund_est_daily_format <- eqs_fund_est_daily %>% 
+  as_tibble %>%
+  select(-Ticker.1) %>%
+  mutate_at(c(
+  "Ticker","Short_Name","ISIN"),as.character) %>%
+  mutate_at(c("GICS_Sector", "GICS_Ind"), as.integer)
+
+#Do the following again on the object that holds
+#most recent cross sectional data:
+#Assign sectors to submodels. This also assigns
+#industries to each of the four submodels
+#because each industry is mapped to a unique sector
+
+#Renaming just for display purposes for book
+eqs_fed <- eqs_fund_est_daily_format
+
+eqs_fed <- eqs_fed %>%
+  ungroup() %>%
+  mutate(submodel = case_when((GICS_Sector == 10 |
+         GICS_Sector == 15 | GICS_Sector == 20)
+  ~ as.character("Cyclicals"), (GICS_Sector == 60 | 
+         GICS_Sector == 55 | GICS_Sector == 40)
+  ~ as.character("Intsen"), (GICS_Sector == 35 | 
+         GICS_Sector == 45 | GICS_Sector == 50)
+  ~ as.character("FastGrowth"), (GICS_Sector == 25 | 
+         GICS_Sector == 30)
+  ~ as.character("StableGrowth")))
+
+#Do the following again on the object that holds
+#most recent cross sectional data:
+
+eqs_fed <- eqs_fed %>% 
+  mutate(EstRev = case_when(
+  !is.na(BEst_EPS_4Wk_pct_Chg_FY2) ~
+  BEst_EPS_4Wk_pct_Chg_FY2,
+  is.na(BEst_EPS_4Wk_pct_Chg_FY2) ~ 
+  BEst_EPS_4Wk_pct_Chg_FY1),
+  BP = Bk_Val_Per_Sh_LF/ PX_LAST, 
+  FEP = BEst_EPS_FY1 / PX_LAST, ROE = ROE_LF, 
+  CFP = CPS_T12M / PX_LAST, 
+  CashIncR = CPS_T12M / EPS_T12M,
+  TEP = EPS_T12M / PX_LAST, 
+  SalesGr = BEst_Sales_YoY_FY0_FY1) %>%
+  select(-Bk_Val_Per_Sh_LF, - BEst_EPS_FY2,
+  -BEst_EPS_FY1, -BEst_EPS_4Wk_pct_Chg_Q,
+  - BEst_EPS_4Wk_pct_Chg_FY1,
+  -BEst_EPS_4Wk_pct_Chg_FY2,
+  -BEst_Sales_YoY_FY0_FY1, -ROE_LF,
+  -CPS_T12M, -EPS_T12M, -PX_LAST)
+
+#Do the following AGAIN for most recent day object:
+Ind_Rel_Rank <- eqs_fed %>%
+  group_by(GICS_Ind) %>%
+  mutate_at(c(
+  "EstRev", "BP", "FEP", "ROE", "CFP", "CashIncR",
+  "TEP", "SalesGr"), ~ntile(.,3))
+
+# Ditto, again:
+Ind_Rel_Rank_long <- Ind_Rel_Rank %>% 
+  ungroup() %>%
+  select(Ticker,Date, submodel, GICS_Ind, GICS_Sector, 
+  c("EstRev", "BP", "FEP", "ROE", "CFP", "CashIncR",
+  "TEP", "SalesGr")) %>%
+  gather(key=Factors, value= Ranking, -Date, -Ticker,
+  -submodel,-GICS_Sector, -GICS_Ind) %>%
+  mutate(Ranking = ifelse(Factors == "SalesGr" & 
+  submodel == "Cyclicals",NA, Ranking),
+  Ranking = ifelse(Factors == "SalesGr" &
+  submodel == "Intsen",
+  NA, Ranking), Ranking = ifelse(
+  Factors == "TEP" &
+  submodel == "Intsen", NA, Ranking), 
+  Ranking = ifelse(Factors == "TEP" &
+  submodel == "Cyclicals", 
+  NA, Ranking), Ranking = ifelse(
+  Factors == "TEP" & 
+  submodel == "FastGrowth", NA, Ranking),
+  Ranking = ifelse(
+  Factors == "FEP" &
+  submodel == "Cyclicals", NA, Ranking),
+  Ranking = ifelse(Factors == "FEP" &
+  submodel == "StableGrowth",NA, Ranking),
+  Ranking = ifelse(Factors == "CFP" & 
+  submodel == "Intsen", NA, Ranking),
+  Ranking = ifelse(
+  Factors == "CashIncR" &
+  submodel == "Intsen", NA, Ranking),
+  Ranking = ifelse(Factors == "ROE" &
+  submodel == "Cyclicals",
+  NA, Ranking), Ranking = ifelse(
+  Factors == "ROE" & 
+  submodel == "FastGrowth", NA, Ranking),
+  Ranking = ifelse(
+  Factors == "BP" &
+  submodel == "FastGrowth", NA, Ranking)) %>%
+  na.omit()
+
+testing <- Ind_Rel_Rank_long %>% 
+  arrange(GICS_Ind,Factors,Ranking)
+```
+
+
+We can preview this data, but we need to chop off the GICS Industry and Sector fields because these are not derived fields at this point. The reader will notice that we now have an industry-relative fundamental factor rank associated with every security. The tibble is in long format, so that is why the number of rows are not around 3,000 but are instead, north of 13,000. This is because we duplicate the tickers, whereby each factor rank is in a different row for the same ticker. 
+
+```{r FactorRanks, eval=TRUE, echo=TRUE, message=FALSE, warning=FALSE, cache = FALSE, tidy = FALSE}
+
+#By factor and ticker
+testing %>% 
+  ungroup() %>%
+  select(-GICS_Ind, -GICS_Sector) %>% 
+  mutate(Ticker = str_replace(
+  Ticker, " US Equity", "")) %>%
+  arrange(Factors, Ticker) %>%
+  print(20)
+
+#By factor
+testing %>% 
+  ungroup() %>%
+  select(-GICS_Ind, -GICS_Sector) %>% 
+  mutate(Ticker = str_replace(
+  Ticker, " US Equity", "")) %>%
+  arrange(Ticker) %>%
+  print(20)
+
+```
+
+We will now combine the fundamental factor ranks (exposures) with the factor weights to obtain a composite fundamental rank for each security. 
+
+
+```{r CompFundamentalRank, eval=TRUE, echo=TRUE, message=FALSE, warning=FALSE, cache = FALSE, tidy = FALSE}
+
+#Do a little cleaning on the object that contains
+#the factor weights
+
+MostRecentWgts <- joinRollFactorPerf %>%
+  ungroup() %>%
+  filter(DATE == max(DATE)) %>%
+  select(Ticker, DATE, submodel, GICS_Ind, 
+  GICS_Sector, Factors, 
+  FactorWgt_ret) %>%
+  distinct(.) 
+
+#Join the factor weights tibble to the factor
+#ranking tibble
+
+JoinWgtExp <- left_join(testing, MostRecentWgts, 
+  by = c("Ticker", "submodel", "GICS_Ind",
+  "GICS_Sector", "Factors"))
+
+#The composite fundamental score (alpha)
+#is the sumproduct of Ranking 
+#and FactorWgt_ret
+
+CalcAlpha <- JoinWgtExp %>%
+  group_by(submodel, Ticker) %>%
+  arrange(submodel, Ticker) %>%
+  mutate(Alpha = sum(Ranking * FactorWgt_ret)) %>%
+  ungroup() %>%
+  select(-DATE)
+
+#Slice to get non-duplicated alphas by Date, 
+#Ticker using 'max'. Get cross sectional Alpha
+#ranks relative to each ticker's industry. 
+#Composite alpha ranks take on values [1,2,3]
+#just like the factor exposures
+
+CalcAlphaRank <- CalcAlpha %>% 
+  select(Ticker, Date, submodel, GICS_Ind, GICS_Sector,
+  Alpha) %>%
+  group_by(Ticker) %>%
+  slice(max(Alpha)) %>%
+  group_by(GICS_Ind) %>%
+  mutate(Alpha_rank = ntile(Alpha, 3)) %>%
+  na.omit() 
+
+CalcAlphaRank %>%
+  ungroup() %>%
+  mutate(Ticker = str_replace(
+  Ticker, " US Equity","")) %>%
+  select(-GICS_Ind, -GICS_Sector) %>%
+  arrange(Ticker) %>%
+  print(20)
+
+```
+
+We now have the first part of the model completed, fundamental composite ranks by security. We now need to layer on the mean reversion part of the model. Here we estimate each security's beta to its industry, and based on that value, rank securities by how much they over(under)shot their industry-beta-implied return over the most recent five trading days. This part of the model can be viewed as our attempt to achieve good execution on the most fundamentally strong/weak names for purchasing/shorting.
+
+```{r LayerMeanRev, eval=TRUE, echo=TRUE, message=FALSE, warning=FALSE, cache = FALSE, tidy = FALSE}
+
+JoinedModels <- left_join(PX_Yahoo, CalcAlphaRank, 
+  by = c("symbol" = "Ticker"))
+
+JoinedModels <- JoinedModels %>%
+  group_by(symbol) %>%
+  arrange(date) %>%
+  mutate(PRET_T5D = adjusted / 
+    dplyr::lag(adjusted, 5) -1)  %>%
+    filter(symbol != "ZVZZT US Equity") %>%
+    filter(symbol != "SDII US Equity") %>%
+    filter(PRET_T5D < 3) %>%
+    ungroup()
+
+Window_Unique_Dates <- unique(JoinedModels$date)
+Window_Unique_Dates <- Window_Unique_Dates %>% 
+  sort(.)
+
+#need to guarantee mrd in seq
+DatePeriodicity_5d <- Window_Unique_Dates[
+  seq(length(Window_Unique_Dates),1, -5)] 
+
+DatePeriodicity_5d <- DatePeriodicity_5d[1:51] %>% 
+  sort(.)
+
+#Industry-beta-derived mean reversion estimator
+JoinedModels_5d <- JoinedModels %>%
+  filter(date %in% DatePeriodicity_5d) %>%
+  filter(!(is.na(Date))) %>%
+  group_by(date,GICS_Ind,Alpha_rank) %>%
+  mutate(Beta_Term = mean(PRET_T5D, na.rm = TRUE)) %>% 
+  #for each GICS Industry on each date, 
+  #get the average group return
+  select(symbol, date, Date, PRET_T5D, Beta_Term,
+  submodel, GICS_Ind, GICS_Sector, Alpha,
+  Alpha_rank) %>%
+  group_by(symbol) %>%
+  mutate(Asset_Point_Deviation = PRET_T5D -
+  mean(PRET_T5D), 
+  Market_Point_Deviation = Beta_Term - mean(Beta_Term),
+  Mom_2 = Asset_Point_Deviation *
+  Market_Point_Deviation) %>%
+  group_by(GICS_Ind, Alpha_rank) %>% 
+  mutate(Beta_z = scale(Beta_Term)) %>% 
+  group_by(symbol) %>% 
+  filter(max(date) == max(date)) %>%
+  summarise(CoVariance_to_Mkt = sum(Mom_2) /
+  (length(date) - 1),
+  Beta = CoVariance_to_Mkt / var(Beta_Term),
+  Scaled_Group_Return = Beta_z[which.max(date)],
+  PRET_T5D = PRET_T5D[which.max(date)],
+  Beta_Term = Beta_Term[which.max(date)],
+  GICS_Ind = GICS_Ind[which.max(date)],
+  GICS_Sector = GICS_Sector [which.max(date)],
+  submodel = submodel [which.max(date)],
+  Alpha = Alpha[which.max(date)],
+  Alpha_rank = Alpha_rank[which.max(date)]) %>%
+  ungroup() %>%
+  arrange(symbol) %>%
+  select(symbol,PRET_T5D,CoVariance_to_Mkt, Beta,
+  Beta_Term, 
+  Scaled_Group_Return, GICS_Ind, GICS_Sector, submodel,
+  Alpha, Alpha_rank) %>%
+  mutate (DATE = max(JoinedModels$date)) %>%
+  filter(abs(CoVariance_to_Mkt) != Inf,
+  abs(Beta) != Inf) %>%
+  na.omit()
+ 
+resid_5d <- JoinedModels_5d %>%
+  mutate(Beta_Pred = Beta * Beta_Term,
+         Beta_Resid = Beta_Pred - PRET_T5D) %>%
+  group_by(GICS_Ind, Alpha_rank) %>%
+  mutate(Beta_Resid_Tertile = ntile(Beta_Resid, 3)) %>%
+  arrange(GICS_Ind,Alpha_rank,Beta_Resid_Tertile)
+
+```
+
+Let us look at the mean reversion part of the output. PRET_T5D is the previous five-day return for each security. Beta_Pred is the predicted return of the security based on its industry beta, where betas were estimated in the code from above. Beta_Resid is the difference between the security's predicted return and actual return over the last five days. When Beta_Resid is higher, on an industry-relative basis, the security tends to have a higher ranking. This is shown in the Beta_Resid_Tertile field.  
+
+```{r MeanRevOutput, eval=TRUE, echo=TRUE, message=FALSE, warning=FALSE, cache = FALSE, tidy = FALSE}
+
+resid_5d %>% 
+ ungroup() %>%
+ mutate(symbol = str_replace(
+ symbol, " US Equity", "")) %>%
+ select(DATE, symbol, PRET_T5D, Beta_Pred, Beta_Resid, 
+ Beta_Resid_Tertile) %>%
+ mutate_at(vars(-symbol),funs(round(.,4))) %>%
+ arrange(symbol) %>%
+ print(20)
+
+```
+
+We are now ready to clean up the output for visualization purposes. The goal here is to have a PDF document showing every pair of long-short candidates. This will require computing a cartesian product of all possibilities, and then filtering out securities that aren't *longs* or *shorts* in the model. Remember, a long will have a fundamental rank of '3' and a mean reversion rank of '3'. A short will have a fundamental rank of '1' and a mean reversion rank of '1'. The other seven ranking possibilities will be removed from our purview. The number of long-short possibilities is also drastically reduced by the fact that we only consider pairs *within* an industry.
+
+```{r LongShortVisuals, eval=TRUE, echo=TRUE, message=FALSE, warning=FALSE, cache = FALSE, tidy = FALSE}
+
+#need to cross join and perform multiple left joins
+#with filters, and then join again to get 
+#every pairwise long-short combination by industry
+
+uniqTick <- unique(PX_Yahoo$symbol)
+crossTick <- crossing(uniqTick,uniqTick)
+crossTable <- left_join(crossTick,select(resid_5d, 
+  c("symbol", "GICS_Ind", "Alpha_rank",
+  "Beta_Resid_Tertile")), by = c(
+  "uniqTick" = "symbol")) %>% 
+  rename(Ind1 = "GICS_Ind", 
+  Alpha1 = "Alpha_rank", Resid1="Beta_Resid_Tertile")
+
+crossTable2 <- left_join(crossTable,select(
+  resid_5d, c("symbol","GICS_Ind", "Alpha_rank",
+  "Beta_Resid_Tertile")), by = c(
+  "uniqTick1" = "symbol")) %>%
+  rename(Ind2 = "GICS_Ind",
+  Alpha2 = "Alpha_rank", Resid2 = "Beta_Resid_Tertile")
+
+#every long-short pair
+filteredLS <- crossTable2 %>% 
+  filter(Ind1 == Ind2, Alpha1 == 3, Resid1 == 3, 
+  Alpha2 == 1, Resid2 == 1) %>%
+  arrange(Ind1, uniqTick, uniqTick1)
+
+#join price data back to each pair
+#mutate for the ratio
+
+LSratio1 <- left_join(filteredLS, PX_Yahoo, 
+  by = c("uniqTick" = "symbol")) %>% 
+  rename(date1 = "date", price1 = "adjusted")
+
+LSratio2 <- left_join(LSratio1, PX_Yahoo, 
+  by = c("uniqTick1" = "symbol", "date1" = "date"))
+
+LSratio <- LSratio2 %>% 
+  rename(price2 = "adjusted") %>% 
+  select(-Alpha1, -Resid1, -Alpha2, -Resid2, -Ind2) %>%
+  arrange(Ind1,uniqTick,uniqTick1,date1) %>%
+  mutate(PX_ratio = price1 / price2)
+
+#some formatting
+LSratio <- LSratio %>% 
+  mutate(uniqTick = str_replace(
+  uniqTick, " US Equity",""),
+  uniqTick1 = str_replace(uniqTick1,
+  " US Equity","")) %>%
+  mutate(LS_pair = paste(
+  uniqTick, uniqTick1, sep = " / "))
+
+
+#create financial attributes to be embedded
+#in chart output. 
+#Volatility, prices and industries
+
+ComboAttr1 <- LSratio %>% group_by(LS_pair) %>% 
+  arrange(LS_pair, date1) %>%
+  mutate(ror1 = price1/dplyr::lag(price1,1) - 1, 
+  ror2 = price2/dplyr::lag(price2,1) - 1, 
+  rorPair = PX_ratio/dplyr::lag(PX_ratio,1) - 1) %>%
+  na.omit() %>%
+  select(date1, price1, price2, Ind1, date1,
+  ror1, ror2, rorPair, LS_pair, uniqTick,
+  uniqTick1) %>%
+  summarise (vol1 = sqrt(252)* sd(ror1), 
+  vol2 = sqrt(252)*sd(ror2), 
+  volPair = sqrt(252)* sd(rorPair),
+  price1 = price1[which.max(date1)],
+  price2 = price2[which.max(date1)],
+  Ind1 = Ind1[which.max(date1)], 
+  date1 = date1[which.max(date1)],
+  Long = uniqTick[which.max(date1)],
+  Short = uniqTick1[which.max(date1)]) %>%
+  mutate(Long = paste(Long, "US Equity"), 
+  Short = paste(Short, "US Equity"))
+
+#add betas and submodel
+ComboAttr2 <- left_join(ComboAttr1, select(
+  resid_5d, symbol, 
+  Beta, submodel, GICS_Ind, Alpha_rank), 
+  by =c("Long" = "symbol")) 
+
+ComboAttr2 <- ComboAttr2 %>% 
+  rename(Beta1 = "Beta") 
+
+ComboAttr2 <- left_join(ComboAttr2, select(
+  resid_5d, symbol, 
+  Beta, submodel, GICS_Ind, Alpha_rank), 
+  by = c("Short" = "symbol"))
+
+ComboAttr2 <- ComboAttr2 %>% 
+  rename(Beta2 = "Beta") %>% 
+  select(LS_pair, vol1, vol2, volPair,
+  price1, price2, Ind1, date1, Long, Short,
+  Beta1, Beta2, submodel.x) %>%
+  rename(submodel = "submodel.x") %>%
+  mutate(LSbeta = Beta1 - Beta2)
+
+#add factor attributes
+Ind_Rel_Rank_long_attr <- Ind_Rel_Rank_long %>% 
+  group_by(Ticker) %>%
+  summarise(FactorCt = n_distinct(Factors), 
+  MedRank = median(Ranking))
+
+ComboAttr3 <- left_join(ComboAttr2,
+  Ind_Rel_Rank_long_attr, 
+  by = c("Long" = "Ticker"))
+
+ComboAttr3 <- ComboAttr3 %>% 
+  rename(FactorCt1 = "FactorCt", MedRank1 = "MedRank")
+
+ComboAttr3 <- left_join(ComboAttr3,
+  Ind_Rel_Rank_long_attr, 
+  by = c("Short" = "Ticker") )
+
+ComboAttr3 <- ComboAttr3 %>% 
+  rename(FactorCt2 = "FactorCt", 
+  MedRank2 = "MedRank")
+
+#add value traded and market cap
+ComboAttr4 <- left_join(ComboAttr3, 
+  select(eqs_fund_est_daily_format,
+  c("Ticker", "Market_Cap", 
+  "medvol_notrank")), by =c("Long" = "Ticker"))
+
+ComboAttr4 <- ComboAttr4 %>%
+  rename(MktCap1 = "Market_Cap", 
+  MedValTrade1 = "medvol_notrank")
+
+ComboAttr4 <- left_join(ComboAttr4,
+  select(eqs_fund_est_daily_format,
+  c("Ticker", "Market_Cap", "medvol_notrank")), 
+  by =c("Short" = "Ticker"))
+
+ComboAttr4 <- ComboAttr4 %>% 
+  rename(MktCap2 = "Market_Cap", 
+  MedValTrade2 = "medvol_notrank", PX_Last1 = "price1", 
+  PX_Last2 = "price2")
+
+#join comboAttr4 back onto LSratio
+LS_pair_joined <- left_join(LSratio, select(ComboAttr4, 
+  c(-"Ind1", -"date1",-"Long", -"Short")),
+  by = c("LS_pair"))
+
+#map industry names to industry code
+industry_map <- read_csv("IndustryMap.csv")
+
+LS_pair_joined <- left_join(
+  LS_pair_joined,industry_map, 
+  by = c("Ind1" = "Industry"))
+
+LS_pair_joined <- LS_pair_joined %>%
+  select(-Ind1) %>%
+  rename(Ind1 = Industry_Name)
+
+LS_pair_joined_cc <- LS_pair_joined %>% 
+  filter(complete.cases(.))
+
+```
+
+Let us also look at some of the attributes that we will output on each chart. This is just a subset of all the items rendered for display purposes.
+
+```{r PreviewLSData, eval=TRUE, echo=TRUE, message=FALSE, warning=FALSE, cache = FALSE, tidy = FALSE}
+
+LS_pair_joined_cc %>% 
+  arrange(LS_pair, desc(date1)) %>% 
+  group_by(LS_pair) %>% 
+  slice(1) %>%
+  select(LS_pair, volPair, LSbeta, MedRank1, 
+  MedRank2 ) %>%
+  mutate_at(vars(volPair, LSbeta), 
+  funs(round(.,2))) %>%
+  print(10)
+
+```
+
+We generate our PDF of plots. Each plot will go on a separate page of the PDF. There are 3,000 + combinations of pairs, so for demonstration purposes, we will output around 50 of them.
+
+```{r PDFCharts, eval=TRUE, echo=TRUE, results = 'hide', message=FALSE, warning=FALSE, cache = FALSE, tidy = FALSE}
+
+#create plot objects
+p <- list()
+Unique_LSPairs <- unique(LS_pair_joined_cc$LS_pair)
+for (i in 3000:length(Unique_LSPairs)) {
+  dat <- subset(LS_pair_joined_cc, 
+  LS_pair == Unique_LSPairs[i])
+  p[[i]] <- ggplot(dat, aes(date1, PX_ratio)) +
+  geom_line() +
+  ggtitle(Unique_LSPairs[i]) + 
+  theme(axis.title.x = element_blank(), 
+  axis.title.y = element_blank()) + 
+  labs(subtitle = paste(
+  max(dat$submodel),"|",max(dat$Ind1),"|",
+  "PairVol =", round(max(dat$volPair),2),
+  "|", "LSBeta = ", round(max(dat$LSbeta),2)),
+  caption = paste(
+  "Long and Short Side Stats:", "Price", 
+  round(max(dat$PX_Last1),2), "/",
+  round(max(dat$PX_Last2),2),
+  "Vol", round(max(dat$vol1),2), "/",
+  round(max(dat$vol2),2),
+  "Beta",round(max(dat$Beta1),2),"/",
+  round(max(dat$Beta2),2),
+  "MktCap ($Mil)", round(max(dat$MktCap1)/ 1e6,0), "/", 
+  round(max(dat$MktCap2)/ 1e6,0),
+  "ValTraded ($Mil)", round(
+  max(dat$MedValTrade1)/1e6,2),"/",
+  round(max(dat$MedValTrade2)/1e6,2),
+  "Median Rank All Factors", 
+  round(max(dat$MedRank1),2), "/",
+  round(max(dat$MedRank2),2),"Factors Available", 
+  max(dat$FactorCt1), "/", max(dat$FactorCt2))) 
+}
+
+#Print each plot object to a single pdf file
+#with each plot on its own page.
+
+pdf("LScharts.pdf", width = 12, onefile = TRUE)
+p[3000:length(Unique_LSPairs)]
+graphics.off()
+```
+
+Let us look at just one of the images from the PDF file. The reader will notice the following attributes: 
+* The long/short pair, their industry membership, combined volatility, and net beta
+* Each pair's last price, volatility, beta, market cap, value traded, fundamental rank, and factor availability
+
+```{r ViewOnePair, eval=TRUE, echo=FALSE, message=FALSE, warning=FALSE, cache = FALSE, tidy = FALSE}
+
+ggplot(dat, aes(date1, PX_ratio)) + geom_line() +
+  ggtitle(Unique_LSPairs[i]) + 
+  theme(axis.title.x = element_blank(), 
+  axis.title.y = element_blank()) + 
+  labs(subtitle = paste(max(dat$submodel),"|",max(dat$Ind1),"|",
+  "PairVol =", round(max(dat$volPair),2),
+  "|", "LSBeta = ", round(max(dat$LSbeta),2)),
+  caption = paste( "Last", 
+  round(max(dat$PX_Last1),2), "/", round(max(dat$PX_Last2),2),
+  "Vol", round(max(dat$vol1),2), "/", round(max(dat$vol2),2),
+  "Beta",round(max(dat$Beta1),2),"/", round(max(dat$Beta2),2),
+  "MktCap", round(max(dat$MktCap1)/ 1e6,0), "/", 
+  round(max(dat$MktCap2)/ 1e6,0),
+  "$Val", round(max(dat$MedValTrade1)/1e6,2),"/",
+  round(max(dat$MedValTrade2)/1e6,2),
+  "MedRnk", round(max(dat$MedRank1),2), "/",
+  round(max(dat$MedRank2),2),"NumFct", 
+  max(dat$FactorCt1), "/", max(dat$FactorCt2)))  
+
+```
+
+At this point we will begin writing several files that will be used in the next section. There, we will utilize R's Shiny package to dissect a hypothetical portfolio relative to a black-box implementation of the model.
+
+```{r PrepareForShiny, eval=TRUE, echo=TRUE, message=FALSE, warning=FALSE, cache = FALSE, tidy = FALSE}
+
+#most recent cross sectional data
+mostRecentXsection1 <- ComboAttr4 %>% 
+  group_by(Long) %>% 
+  filter(row_number() == 1) %>% 
+  select(Ticker = Long, Vol = vol1, Price = PX_Last1, 
+  Industry = Ind1, IndBeta = Beta1, submodel, 
+  FactorsAvail = FactorCt1, MedRank = MedRank1, 
+  MktCap = MktCap1, MedValTrade = MedValTrade1) %>% 
+  mutate (L_S = "Long")
+
+mostRecentXsection2 <- ComboAttr4 %>% 
+  group_by(Short) %>% 
+  filter(row_number() == 1) %>% 
+  select(Ticker = Short, Vol = vol2, Price = PX_Last2, 
+  Industry = Ind1, IndBeta = Beta2, submodel, 
+  FactorsAvail = FactorCt2, MedRank = MedRank2,
+  MktCap = MktCap2,
+  MedValTrade = MedValTrade2) %>% 
+  mutate (L_S = "Short")
+
+mostRecentXsection <- rbind(mostRecentXsection1,
+  mostRecentXsection2)
+
+mostRecentXsection <- mostRecentXsection %>%
+  ungroup() %>%
+  mutate(Ticker = str_replace(Ticker, 
+  " US Equity", "")) 
+
+#We will use this last object in Shiny
+write_csv(mostRecentXsection, "mostRecentXsection.csv")
+
+#Time series data
+RoRs <- PX_Yahoo %>%
+  group_by(symbol) %>%
+  arrange(symbol,date) %>%
+  mutate(ror = adjusted/dplyr::lag(adjusted,1) - 1) %>%
+  ungroup() %>%
+  mutate(Ticker = str_replace(
+  symbol, " US Equity", "")) %>%
+  select(Ticker, date, ror, -symbol) %>%
+  na.omit() 
+
+#We will use this last object in Shiny
+write_csv(RoRs, "RoRs.csv")
+
+#Market aggregates timeseries data
+#Get two years of daily price history
+#from Yahoo Finance.This is the data that
+#will allow us to compare a portfolio to other
+#managers' portfolios and to other broad-based
+#market instruments.
+
+PX_Yahoo_Aggr_TickerSet <- c("SPY", "UUP", "TLT",
+  "GLD","GCC","NIMEX", "QMNIX", "VMNIX", "PPMAX",
+  "CPMNX", "ZMNIX","JPMNX", "ALIAX", "CPNSX",
+  "ACVKX", "RPG", "RPV", "IWM", "SPMO")
+
+#PX_Yahoo_aggr <- tq_get(PX_Yahoo_Aggr_TickerSet, 
+# get = "stock.prices", from = "2017-10-9", 
+# to = "2019-10-25")
+
+#PX_Yahoo_aggr <- PX_Yahoo_aggr %>% 
+# select(symbol, date, 
+# adjusted)
+
+PX_Yahoo_aggr<- read_csv("PX_Yahoo_aggr.csv")
+
+RoRs_Aggregates <- PX_Yahoo_aggr %>%
+  ungroup() %>%
+  group_by(symbol) %>%
+  arrange(symbol,date) %>%
+  mutate(ror = adjusted/dplyr::lag(adjusted,1) - 1) %>%
+  ungroup() %>%
+  rename(Ticker = symbol) %>%
+  select(Ticker, date, ror) %>%
+  na.omit() 
+
+
+#We will use this last object in Shiny
+write_csv(RoRs_Aggregates, "RoRs_Aggregates.csv")
+
+#Need to get non-model most recent cross sectional data
+#in case we end up owning a security that subsequently 
+#loses its status as a model 'long' or 'short'
+
+#model securities
+modelTick <- paste(mostRecentXsection$Ticker,
+  "US Equity")
+
+
+nonmodel_crossTable2 <- crossTable2 %>% 
+  filter(!uniqTick %in% modelTick) %>%
+  group_by(uniqTick) %>% 
+  filter(row_number()==1) %>%
+  select(-uniqTick1, -Ind2, -Alpha2, -Resid2)
+
+#Join price data back to each pair.
+#Mutate for the ratio
+
+nonmodel_LSratio <- left_join(nonmodel_crossTable2, 
+  PX_Yahoo, by = c("uniqTick" = "symbol")) %>% 
+  rename(date1 = "date", price1 = "adjusted")
+
+nonmodel_LSratio <- nonmodel_LSratio %>% 
+  ungroup() %>%
+  select(-Alpha1, -Resid1) %>%
+  arrange(Ind1,uniqTick,date1) %>%
+  mutate(uniqTick = str_replace(uniqTick,
+  " US Equity",""))
+
+
+#Nonmodel attributes
+nonmodel_ComboAttr1 <- nonmodel_LSratio %>%
+  group_by(uniqTick) %>% 
+  arrange(uniqTick, date1) %>%
+  mutate(ror1 = price1/dplyr::lag(price1,1) - 1) %>%
+  na.omit() %>%
+  select(date1, price1, Ind1, ror1, uniqTick) %>%
+  summarise (vol1 = sqrt(252)* sd(ror1),
+  price1 = price1[which.max(date1)],
+  Ind1 = Ind1[which.max(date1)], 
+  date1 = date1[which.max(date1)],
+  NonModel = uniqTick[which.max(date1)]) %>%
+  mutate(NonModel = paste(NonModel, "US Equity"))
+
+#Nonmodel add betas and submodel
+nonmodel_ComboAttr2 <- left_join(nonmodel_ComboAttr1, 
+  select(resid_5d, symbol, Beta, submodel, GICS_Ind, 
+  Alpha_rank), by =c("NonModel" = "symbol")) 
+
+nonmodel_ComboAttr2 <- nonmodel_ComboAttr2 %>% 
+  rename(Beta1 = "Beta") 
+
+#Nonmodel add factor attributes
+nonmodel_ComboAttr3 <- left_join(nonmodel_ComboAttr2, 
+  Ind_Rel_Rank_long_attr,
+  by = c("NonModel" = "Ticker"))
+
+nonmodel_ComboAttr3 <- nonmodel_ComboAttr3 %>% 
+  rename(FactorCt1 = "FactorCt", MedRank1 = "MedRank")
+
+#Nonmodel add value traded and market cap
+nonmodel_ComboAttr4 <- left_join(nonmodel_ComboAttr3, 
+  select(eqs_fund_est_daily_format,
+  c("Ticker", "Market_Cap",
+  "medvol_notrank")), by =c("NonModel" = "Ticker"))
+
+nonmodel_ComboAttr4 <- nonmodel_ComboAttr4 %>% 
+  rename(MktCap1 = "Market_Cap", 
+  MedValTrade1 = "medvol_notrank", PX_Last1 = 'price1')
+
+
+#Nonmodel most recent cross sectional data
+nonmodel_mostRecentXsection <- nonmodel_ComboAttr4 %>% 
+  select(-NonModel, -date1, -Alpha_rank, -GICS_Ind, 
+  Ticker = uniqTick, Vol = vol1, Price = PX_Last1, 
+  Industry = Ind1, IndBeta = Beta1, submodel, 
+  FactorsAvail = FactorCt1, MedRank = MedRank1, 
+  MktCap = MktCap1, MedValTrade = MedValTrade1) %>% 
+  mutate (L_S = "NonModel")
+
+#We will use this last object in Shiny
+write_csv(nonmodel_mostRecentXsection, 
+  "nonmodel_mostRecentXsection.csv")
+
+#Model plus nonmodel most recent cross sectional data
+ALL_mostRecentXsection <- rbind(mostRecentXsection,
+  nonmodel_mostRecentXsection)
+
+#We will use this last object in Shiny
+write_csv(ALL_mostRecentXsection, 
+  "ALL_mostRecentXsection.csv")
+
+
+#Calculate model security weights.
+#Each security will have a weighting that is equal to
+#the reciprocal number of securities on a side (L/S)
+#for a pariticular industry divided by the total number
+#of industries.
+
+ModelWgtObject <-mostRecentXsection %>% 
+  group_by(L_S, Industry) %>% 
+  arrange(Industry, L_S) %>%
+  mutate(total_LS_Ind = n()) %>%  
+  ungroup() %>%
+  mutate(total_Ind = n_distinct(Industry))%>%
+  mutate(ModelWgt = (1/total_LS_Ind)/ (total_Ind)) %>%
+  mutate(ModelWgt = ifelse(L_S == "Long", 100*ModelWgt,
+  -100*ModelWgt)) %>%
+  select(Ticker, ModelWgt)
+
+#We will use this last object in Shiny
+write_csv(ModelWgtObject, "ModelWgtObject.csv")
+```
+
+Let us look at the output of some of the objects from this section that will serve as input items in Shiny.
+
+```{r ShinyInput, eval=TRUE, echo=TRUE, message=FALSE, warning=FALSE, cache = FALSE, tidy = FALSE}
+
+#Have to remove industry codes since these
+#are not derived. 
+#Replacing with Industry Names
+
+ALL_mostRecentXsection %>%
+  left_join(.,industry_map, by = c("Industry")) %>%
+  select(-Industry) %>%
+  mutate(Vol = round(Vol,2),
+  IndBeta = round(IndBeta,2))
+
+ModelWgtObject 
+RoRs_Aggregates
+RoRs
+
+```
+
+In the next section we begin the Shiny app so that we can customize our interactions with the portfolio and model. 
